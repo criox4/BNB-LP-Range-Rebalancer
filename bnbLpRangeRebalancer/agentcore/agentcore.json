@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "bnbLpRangeRebalancer",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "bnbLpRangeRebalancer"
+  },
+  "runtimes": [
+    {
+      "name": "bnbLpRangeRebalancer",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/agent/",
+      "networkMode": "PUBLIC",
+      "protocol": "A2A",
+      "envVars": [
+        {
+          "name": "OTEL_TRACES_EXPORTER",
+          "value": "none"
+        }
+      ],
+      "runtimeVersion": "PYTHON_3_14"
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "payments": []
+}

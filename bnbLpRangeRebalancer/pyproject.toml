@@ -1,0 +1,10 @@
+# Seller agent workspace — NOT a pip/uv-installable package.
+# The deployable AgentCore project (agentcore/ + CDK) was created by
+# `agentcore create`; bag added the agent sub-project under app/agent.
+# The agent's bnbagent-studio-core pin resolves from PyPI (working from a
+# studio source checkout? install that core editable first instead):
+#
+#   python -m venv app/agent/.venv
+#   app/agent/.venv/bin/pip install -e ./app/agent
+#
+# Then run the agent:  bag dev

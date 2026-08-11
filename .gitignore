@@ -1,0 +1,26 @@
+# Workspace root. The agent sub-project ships its own .gitignore covering the
+# encrypted keystore (.studio/) and agentcore/.env.local — never commit those.
+
+# Virtualenvs
+.venv/
+.venv-*/
+
+# Skills installed by `bag skills install` — regeneratable, not source.
+.claude/skills/
+
+# Agent runtime state: rebalance history + counters, written per network.
+# Local operational state, not source. It records real tx hashes but no secrets.
+.lp_state.*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+.idea/
+.vscode/

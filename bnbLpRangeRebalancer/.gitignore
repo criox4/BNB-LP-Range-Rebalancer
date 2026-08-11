@@ -1,0 +1,30 @@
+# bnbagent-studio workspace defaults.
+# All agent secrets — the encrypted keystore AND .env.local — live HERE under
+# .studio/ at the workspace root, OUTSIDE app/agent (the AgentCore codeLocation),
+# so no deploy packaging path can bundle them. Never commit .studio/.
+.studio/
+
+# `bag dev --container` writes the runtime secret bundle (wallet material +
+# unlock password + provider/storage keys) into agentcore/.env.local so the dev
+# container can sign. The agentcore/ dir is otherwise committed, so ignore the
+# secret file here (never commit it).
+agentcore/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+*.egg-info/
+build/
+dist/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Skills installed at workspace root (CC picks them up automatically;
+# they're regeneratable via `bag skills install --scope project`).
+.claude/skills/

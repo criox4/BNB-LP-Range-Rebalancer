@@ -1,0 +1,64 @@
+[project]
+name = "bnbLpRangeRebalancer-agent"
+
+[stack]
+# Project-lifetime facts: which framework / runtime adapter recipes this
+# Agent was scaffolded against. doctor / dev / deploy read these to know
+# what to check, load, and route. framework: adk; runtime: agentcore | azure-foundry.
+framework = "adk"
+runtime = "agentcore"
+# External protocol this runtime serves (one runtime, one signer):
+#   A2A — serve_a2a: agent card + negotiate/notify_funded skills.
+#   MCP — FastMCP on /mcp: negotiate (signed quote) + notify_funded (verify →
+#         deliver → submit, synchronously within the tool call) + read-only chain
+#         tools. MCP delivery runs in-call (≤ ~15 min); the runtime is stateful.
+protocol = "A2A"
+
+[network]
+default = "bsc-mainnet"
+
+[wallet]
+# Local keystore signer. The Agent is the SOLE key-holder/signer.
+# The keystore lives at the WORKSPACE root — outside app/agent (the AgentCore
+# codeLocation) — so no packaging path can bundle it into a deploy artifact.
+kind = "evm-local"
+signer = "local"
+keystore_dir = "../../.studio/wallets"
+# address = "0x..."   # filled by `bag wallet new`
+address = "0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b"
+
+[llm]
+provider = "openrouter"
+model = "openai/gpt-4o-mini"
+
+[payments.erc8183]
+# Read by the Agent: it quotes the FIXED `price`, CLAMPS it to [min,max],
+# freezes a short-TTL offer, and EIP-191 signs it — pricing is rule-based, the
+# LLM never prices.
+currency = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"   # $U token address — prefilled from [network].default
+price = "100000000000000000"                   # wei — your list price (0.1 U); what every quote charges
+min_price = "0"                                # wei — clamp floor
+max_price = "1000000000000000000"              # wei — clamp ceiling (1 U = 10x list price)
+quote_ttl_seconds = 900                        # seconds a signed quote stays valid; SDK caps at 900 (~15min work window)
+default_estimated_completion_seconds = 600
+poll_interval_seconds = 30
+auto_settle = false                            # opt-in: detect dispute-window-elapsed → settle
+
+[strategy]
+# LP rebalancer parameters (spec 4.3: "strategy parameters should be
+# configurable"). Read by pancake.py; edit here, not in code.
+pair = "BNB/USDT"
+fee = 500                  # pool fee tier in hundredths of a bip (500 = 0.05%)
+token_id = 7116193         # mainnet BNB/USDT position (minted 2026-08-11)
+                           # (testnet run used token_id 36780 — IDs are per-network)
+range_pct = 10.0           # target range half-width: +/-10% around spot
+trigger_pct = 5.0          # rebalance when price is within 5% OF RANGE WIDTH
+                           # of either bound (spec 4.3: 630-770 -> 637/763)
+max_slippage_pct = 1.0     # swap guard; the testnet pool is shallow enough that
+                           # 1 BNB moves it ~44%, so keep test sizes small
+
+[storage]
+# Deliverables written to local disk (file://). Offline-dev only —
+# does NOT survive deploy. Path from STORAGE_LOCAL_PATH.
+kind = "local"
+

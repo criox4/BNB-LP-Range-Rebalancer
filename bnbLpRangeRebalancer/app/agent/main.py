@@ -156,7 +156,17 @@ agent = Agent(
         "context helps. If a paid-data tool such as `buy_with_x402` is available "
         "to you, USE IT to fetch the data a task needs — those merchants (e.g. "
         "CoinMarketCap) charge via on-chain wallet payment, NOT an API key; never "
-        "reply that you cannot complete the task for lack of an API key."
+        "reply that you cannot complete the task for lack of an API key. "
+        # Numeric discipline. Handed the raw status dict, this agent reported the
+        # raw V3 liquidity integer as "TVL: 335,389.79 BNB" (real TVL: $0.81) and
+        # invented pending-fee figures ~1e12 too large. For a paid status report
+        # the numbers ARE the product, so they come from code, not from the model.
+        "For ANY question about the LP position's status or economics, call "
+        "`get_status_report` and quote its figures VERBATIM. Never compute, "
+        "convert, round, or reformat a financial number yourself, and never state "
+        "a figure you did not read from a tool result. `liquidity_raw` is V3 "
+        "liquidity units — NOT a token amount and NOT a money value; the money "
+        "figure is `tvl`. If a number is not in a tool result, say it is unavailable."
     ),
     # LLM_READ_TOOLS = read-only chain tools (wallet, balances, ERC-8004/8183
     # queries). Edit `tools.py` to add/remove. These are READ-ONLY — the agent
@@ -228,7 +238,16 @@ agent_card = build_agent_card()
 # this module never starts moving funds on its own. The decision and the
 # calldata are both fixed code — see strategy.py / lp_signing.py.
 try:
+    from pancake import check_config_consistency
     from strategy import start_monitor
+
+    # Loud at boot: cross-field config errors (wrong-chain currency, a token_id
+    # from the other network) are invisible to per-field validation and only
+    # surface as a signed-but-worthless quote or a trade against the wrong
+    # position. Warn rather than exit so a config typo can't take the A2A
+    # surface down.
+    for _problem in check_config_consistency():
+        logging.getLogger("seller-agent").error("CONFIG: %s", _problem)
 
     start_monitor()
 except Exception as exc:  # noqa: BLE001 — the A2A surface must serve regardless

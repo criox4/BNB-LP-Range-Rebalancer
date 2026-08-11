@@ -141,6 +141,63 @@ def test_price_range_maps_to_inverted_ticks():
     assert tick_for_lower > tick_for_upper, (tick_for_lower, tick_for_upper)
 
 
+def test_liquidity_amounts_roundtrip():
+    """amounts -> liquidity -> amounts must return what the contract would take."""
+    from pancake import amounts_to_liquidity, liquidity_to_amounts
+
+    # Spot inside the range: both tokens used.
+    tick, lower, upper = -64154, -65090, -63070
+    sqrt_x96 = int((1.0001 ** (tick / 2)) * 2**96)
+    a0, a1 = 10**18, 10**16
+    liq = amounts_to_liquidity(a0, a1, sqrt_x96, lower, upper)
+    assert liq > 0, liq
+    got0, got1 = liquidity_to_amounts(liq, sqrt_x96, lower, upper)
+    # The binding side is consumed fully; neither side may exceed what we offered.
+    assert got0 <= a0 * 1.0001 and got1 <= a1 * 1.0001, (got0, got1, a0, a1)
+    assert abs(got0 - a0) < a0 * 1e-6 or abs(got1 - a1) < a1 * 1e-6, (got0, got1)
+
+
+def test_liquidity_amounts_out_of_range_is_single_sided():
+    """Below the range it is all token0; above, all token1. This is what makes a
+    flat percentage-of-desired mint floor wrong."""
+    from pancake import liquidity_to_amounts
+
+    lower, upper, liq = -65090, -63070, 10**18
+    below = int((1.0001 ** (-66000 / 2)) * 2**96)
+    above = int((1.0001 ** (-62000 / 2)) * 2**96)
+    a0, a1 = liquidity_to_amounts(liq, below, lower, upper)
+    assert a0 > 0 and a1 == 0, (a0, a1)
+    b0, b1 = liquidity_to_amounts(liq, above, lower, upper)
+    assert b0 == 0 and b1 > 0, (b0, b1)
+
+
+def test_zero_liquidity_has_no_amounts():
+    from pancake import liquidity_to_amounts
+
+    assert liquidity_to_amounts(0, 2**96, -100, 100) == (0, 0)
+
+
+def test_fees_since_window_incompleteness_is_reported():
+    """A short watch window must never be presented as a full 24h figure."""
+    import time as _t
+
+    from strategy import _fees_since
+
+    now = _t.time()
+    # Only 1h of history: the window is incomplete.
+    recent = [{"ts": now - 3600, "fees_usdt": 1.0}]
+    val, complete = _fees_since(recent, 86400, 3.0)
+    assert val == 2.0 and complete is False, (val, complete)
+
+    # A sample older than 24h completes the window.
+    old = [{"ts": now - 90000, "fees_usdt": 1.0}, {"ts": now - 3600, "fees_usdt": 2.5}]
+    val, complete = _fees_since(old, 86400, 3.0)
+    assert val == 2.0 and complete is True, (val, complete)
+
+    # No history at all.
+    assert _fees_since([], 86400, 5.0) == (0.0, False)
+
+
 def _live_smoke():
     """Read-only smoke test against BSC testnet. Needs network."""
     from pancake import get_bnb_price, get_lp_position, get_pending_fees
@@ -250,6 +307,44 @@ def _live_guards():
     print("write-path guards OK")
 
 
+def _live_config_consistency():
+    """The config guard must flag a wrong-chain currency — the bug that shipped
+    a mainnet quote payable in the testnet token."""
+    from bnbagent.networks import BNB_CHAIN_ADDRESSES
+
+    from pancake import check_config_consistency, default_network
+
+    problems = check_config_consistency()
+    for p in problems:
+        print(f"  PROBLEM: {p}")
+    assert not problems, f"config is inconsistent: {problems}"
+
+    net = default_network()
+    chain_id = {"bsc-mainnet": 56, "bsc-testnet": 97}[net]
+    print(f"  ok  config consistent for {net}: currency == "
+          f"{BNB_CHAIN_ADDRESSES[chain_id].payment_token}")
+
+    # Prove the guard actually fires rather than always returning clean.
+    import pancake as pcs
+
+    other = 97 if chain_id == 56 else 56
+    wrong = BNB_CHAIN_ADDRESSES[other].payment_token
+    real_loader = pcs.check_config_consistency
+    from bnbagent_studio_core import config as _config
+
+    orig = _config.load_studio_toml
+    try:
+        _config.load_studio_toml = lambda *a, **k: {
+            "payments": {"erc8183": {"currency": wrong}}, "strategy": {"token_id": 0}
+        }
+        got = real_loader(net)
+        assert got and "not the U token" in got[0], got
+        print("  ok  guard fires on a wrong-chain currency")
+    finally:
+        _config.load_studio_toml = orig
+    print("config guard OK")
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
@@ -260,6 +355,7 @@ def main() -> None:
         _live_smoke()
         _live_addressbook()
         _live_guards()
+        _live_config_consistency()
 
 
 if __name__ == "__main__":

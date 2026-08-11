@@ -86,12 +86,79 @@ def _update(**fields) -> dict[str, Any]:
         return state
 
 
+# --- Fee / PnL accounting ------------------------------------------------------
+# Spec 4.6 wants fees_24h and pnl. Neither is readable from chain state alone:
+# the pool exposes only fees pending RIGHT NOW, and a rebalance resets that to
+# zero by collecting. So the agent samples its own running total over time and
+# differences the samples. That makes fees_24h exact only back to the first
+# snapshot — before the agent started watching, it is blind.
+# ponytail: snapshots in the state file; an indexer would give true history.
+SNAPSHOT_KEEP = 500
+SNAPSHOT_MIN_GAP_SECONDS = 300  # don't fill the file on a 60s poll
+
+
+def _to_usdt(usdt: float, bnb: float, price: float) -> float:
+    return usdt + bnb * price
+
+
+def fees_earned_usdt(state: dict[str, Any], pending: dict[str, Any], price: float) -> float:
+    """Everything this agent has earned in fees: collected plus still-pending."""
+    return (
+        _to_usdt(state["fees_collected_usdt"], state["fees_collected_bnb"], price)
+        + _to_usdt(pending.get("fees_usdt", 0.0), pending.get("fees_bnb", 0.0), price)
+    )
+
+
+def _record_snapshot(state: dict[str, Any], fees_usdt: float, tvl_usdt: float,
+                     price: float) -> list[dict[str, Any]]:
+    """Append a fee/TVL sample, rate-limited and bounded."""
+    snaps = list(state.get("snapshots") or [])
+    now = time.time()
+    if snaps and (now - float(snaps[-1]["ts"])) < SNAPSHOT_MIN_GAP_SECONDS:
+        return snaps
+    snaps.append({"ts": now, "at": _now(), "fees_usdt": fees_usdt,
+                  "tvl_usdt": tvl_usdt, "price": price})
+    return snaps[-SNAPSHOT_KEEP:]
+
+
+def _fees_since(snaps: list[dict[str, Any]], seconds: float,
+                current_fees: float) -> tuple[float, bool]:
+    """``(fees earned in the window, window_is_complete)``.
+
+    ``window_is_complete`` is False when the agent has not been watching for the
+    full window — the figure is then a floor, not a 24h total, and callers must
+    say so rather than presenting a partial number as complete.
+    """
+    if not snaps:
+        return (0.0, False)
+    cutoff = time.time() - seconds
+    older = [s for s in snaps if float(s["ts"]) <= cutoff]
+    if older:
+        return (max(0.0, current_fees - float(older[-1]["fees_usdt"])), True)
+    return (max(0.0, current_fees - float(snaps[0]["fees_usdt"])), False)
+
+
 # --- The decision (deterministic; no LLM) --------------------------------------
 def check() -> dict[str, Any]:
-    """One Monitor-loop pass: read chain state, decide, do not act."""
+    """One Monitor-loop pass: read chain state, decide, do not act.
+
+    Also records the fee/TVL snapshot that fees_24h and pnl are derived from.
+    """
     token_id = pcs.managed_token_id()
     summary = pcs.get_position_summary(token_id, NETWORK)
-    _update(last_check=_now())
+    try:
+        value = pcs.get_position_value(token_id, NETWORK)
+        state = load_state()
+        fees = fees_earned_usdt(state, summary["pending_fees"], summary["current_price"])
+        _update(
+            last_check=_now(),
+            snapshots=_record_snapshot(
+                state, fees, value.get("tvl_usdt", 0.0), summary["current_price"]
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — accounting must not break monitoring
+        log.warning("snapshot failed: %s", e)
+        _update(last_check=_now())
     return summary
 
 
@@ -121,6 +188,14 @@ def get_status() -> dict[str, Any]:
                 "status": state["status"], "error": str(e)}
 
     fees = s["pending_fees"]
+    price = s["current_price"]
+    try:
+        tvl = pcs.get_position_value(s["token_id"], NETWORK).get("tvl_usdt", 0.0)
+    except Exception:  # noqa: BLE001
+        tvl = 0.0
+    earned = fees_earned_usdt(state, fees, price)
+    gas_usdt = state["gas_spent_wei"] / 1e18 * price
+    fees_24h, complete_24h = _fees_since(state.get("snapshots") or [], 86400, earned)
     return {
         "agent": "BNB LP Rebalancer",
         "category": "rebalancing",
@@ -136,13 +211,70 @@ def get_status() -> dict[str, Any]:
         "in_range": s["in_range"],
         "rebalance_required": s["rebalance_required"],
         "rebalance_reason": s["rebalance_reason"],
-        "liquidity": s["liquidity"]["position_liquidity"],
+        # Raw V3 liquidity units — NOT a token amount and NOT a money value.
+        # Named explicitly because an LLM handed a bare `liquidity: 3.35e17`
+        # reported it as "TVL: 335,389.79 BNB". Money lives in `tvl` below.
+        "liquidity_raw": s["liquidity"]["position_liquidity"],
         "pending_fees_usdt": fees.get("fees_usdt", 0.0),
         "pending_fees_bnb": fees.get("fees_bnb", 0.0),
+        # spec 4.6 economics
+        "tvl": tvl,
+        "fees_24h": fees_24h,
+        # False => the agent has been watching for less than 24h, so fees_24h is
+        # a floor over a shorter window. Never present it as a full day.
+        "fees_24h_window_complete": complete_24h,
+        "fees_total": earned,
+        "pnl": earned - gas_usdt,
+        "gas_cost": gas_usdt,
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],
         "gas_cost_bnb": state["gas_spent_wei"] / 1e18,
     }
+
+
+def get_status_report() -> str:
+    """The position status as a finished, human-readable report.
+
+    Every figure here is formatted by CODE. The LLM is told to quote this
+    verbatim rather than compute or reformat numbers itself, because when it
+    was handed the raw dict it reported the raw liquidity integer as "TVL:
+    335,389.79 BNB" (real TVL: $0.81) and invented pending-fee values that were
+    twelve orders of magnitude too large. Deterministic figures are the whole
+    product for a paid status report — this is the same principle as spec
+    section 3, applied to numbers the agent SAYS rather than numbers it signs.
+    """
+    s = get_status()
+    if "error" in s:
+        return f"LP Rebalancer status unavailable: {s['error']}"
+
+    def money(v: float, unit: str = "USDT") -> str:
+        if v == 0:
+            return f"0 {unit}"
+        return f"{v:.8f} {unit}".rstrip("0").rstrip(".") if abs(v) < 0.01 \
+            else f"{v:,.4f} {unit}"
+
+    window = "" if s["fees_24h_window_complete"] else " (partial window — the agent " \
+                                                      "has been watching for under 24h)"
+    return "\n".join([
+        "BNB LP Rebalancer — PancakeSwap V3 BNB/USDT",
+        f"  network            : {s['network']}",
+        f"  status             : {s['status']}",
+        f"  position (NFT)     : {s['token_id']}",
+        f"  current price      : {money(s['current_price'])} per BNB",
+        f"  range              : {money(s['lower_price'])} - {money(s['upper_price'])}",
+        f"  range utilization  : {s['range_utilization']:.2f}% "
+        f"(0% = centred, 100% = at a bound)",
+        f"  in range           : {'yes' if s['in_range'] else 'NO'}",
+        f"  rebalance required : {'YES' if s['rebalance_required'] else 'no'} "
+        f"({s['rebalance_reason']})",
+        f"  TVL                : {money(s['tvl'])}",
+        f"  fees (24h)         : {money(s['fees_24h'])}{window}",
+        f"  fees (total)       : {money(s['fees_total'])}",
+        f"  gas spent          : {money(s['gas_cost'])}",
+        f"  net PnL            : {money(s['pnl'])}",
+        f"  rebalances         : {s['rebalance_count']} "
+        f"(last: {s['last_rebalance'] or 'never'})",
+    ])
 
 
 def get_position() -> dict[str, Any]:
@@ -160,10 +292,16 @@ def get_performance() -> dict[str, Any]:
     """
     state = load_state()
     pending = {"fees_usdt": 0.0, "fees_bnb": 0.0}
+    price, tvl = 0.0, 0.0
     try:
         pending = pcs.get_pending_fees(state["token_id"], NETWORK)
+        price = pcs.get_bnb_price(NETWORK)["price_usdt_per_bnb"]
+        tvl = pcs.get_position_value(state["token_id"], NETWORK).get("tvl_usdt", 0.0)
     except Exception:  # noqa: BLE001
         pass
+    earned = fees_earned_usdt(state, pending, price)
+    gas_usdt = state["gas_spent_wei"] / 1e18 * price
+    fees_24h, complete_24h = _fees_since(state.get("snapshots") or [], 86400, earned)
     return {
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],
@@ -174,6 +312,13 @@ def get_performance() -> dict[str, Any]:
         "fees_pending_bnb": pending.get("fees_bnb", 0.0),
         "fees_total_usdt": state["fees_collected_usdt"] + pending.get("fees_usdt", 0.0),
         "fees_total_bnb": state["fees_collected_bnb"] + pending.get("fees_bnb", 0.0),
+        "fees_total_value_usdt": earned,
+        "fees_24h_usdt": fees_24h,
+        "fees_24h_window_complete": complete_24h,
+        "gas_spent_usdt": gas_usdt,
+        "pnl_usdt": earned - gas_usdt,
+        "tvl_usdt": tvl,
+        "snapshots_recorded": len(state.get("snapshots") or []),
         "history": state["history"][-20:],
     }
 

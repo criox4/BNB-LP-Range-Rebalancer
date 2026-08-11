@@ -58,6 +58,7 @@ token_id = 7116214  # mainnet BNB/USDT position (minted 2026-08-11)
 range_pct = 10.0           # target range half-width: +/-10% around spot
 trigger_pct = 5.0          # rebalance when price is within 5% OF RANGE WIDTH
                            # of either bound (spec 4.3: 630-770 -> 637/763)
+mint_slippage_pct = 1.0    # floor on the mint deposit, vs the PREDICTED amounts
 max_slippage_pct = 1.0     # swap guard; the testnet pool is shallow enough that
                            # 1 BNB moves it ~44%, so keep test sizes small
 

@@ -58,6 +58,7 @@ LP_READ_TOOLS = [
 import strategy as strat  # noqa: E402 — after LP tools for readability
 
 STATUS_READ_TOOLS = [
+    FunctionTool(strat.get_status_report),  # prefer this: figures formatted by code
     FunctionTool(strat.get_status),
     FunctionTool(strat.get_position),
     FunctionTool(strat.get_performance),

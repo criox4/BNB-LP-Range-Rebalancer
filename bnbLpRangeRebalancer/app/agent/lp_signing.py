@@ -260,7 +260,7 @@ def execute_swap(token_in: str, token_out: str, amount_in_wei: int,
 
 def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
                   lower_price: float, upper_price: float,
-                  amount0_min: int = 0, amount1_min: int = 0,
+                  amount0_min: int | None = None, amount1_min: int | None = None,
                   network: str = "bsc-testnet") -> dict[str, Any]:
     """Mint a new concentrated-liquidity position over a BNB price range.
 
@@ -268,14 +268,33 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
     its inversion, since token0 is USDT) happens in
     :func:`pancake.price_range_to_ticks`.
 
-    ``amount0_min``/``amount1_min`` default to 0, which accepts any deposit
-    ratio. That is fine on testnet — the tokens go into OUR OWN position, so
-    the risk is ratio drift rather than loss — but set them on mainnet.
-    ponytail: zero mins, tighten before any mainnet mint.
+    When ``amount0_min``/``amount1_min`` are None they are DERIVED: predict the
+    deposit the contract will actually take (the same liquidity math it uses
+    internally) and floor it by ``[strategy].mint_slippage_pct``. A flat
+    percentage of the *desired* amounts would be wrong — for a range sitting to
+    one side of spot the contract legitimately consumes almost none of one
+    token, so a naive floor would revert every such mint.
     """
     cfg = pcs._cfg(network)
     ticks = pcs.price_range_to_ticks(lower_price, upper_price, network)
     recipient = Web3.to_checksum_address(get_wallet().address)
+
+    if amount0_min is None or amount1_min is None:
+        slip = float(pcs.strategy_config().get("mint_slippage_pct", 1.0)) / 100.0
+        sqrt_price_x96 = int(pcs._pool(network).functions.slot0().call()[0])
+        liq = pcs.amounts_to_liquidity(
+            amount_usdt_wei, amount_wbnb_wei, sqrt_price_x96,
+            ticks["tick_lower"], ticks["tick_upper"],
+        )
+        exp0, exp1 = pcs.liquidity_to_amounts(
+            liq, sqrt_price_x96, ticks["tick_lower"], ticks["tick_upper"]
+        )
+        if amount0_min is None:
+            amount0_min = int(exp0 * (1 - slip))
+        if amount1_min is None:
+            amount1_min = int(exp1 * (1 - slip))
+        log.info("mint mins: expected (%s, %s) -> floor (%s, %s) at %.2f%%",
+                 exp0, exp1, amount0_min, amount1_min, slip * 100)
 
     if amount_usdt_wei > 0:
         approve_exact(cfg["usdt"], cfg["position_manager"], amount_usdt_wei, network)

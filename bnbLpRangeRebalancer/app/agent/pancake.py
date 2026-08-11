@@ -117,6 +117,43 @@ ERC20_ABI = [
 ]
 
 
+def _retry_rpc(fn):
+    """Retry a chain read a few times before giving up.
+
+    The public BSC endpoints are load balanced, and a node that has not caught
+    up answers ``positions()`` for a perfectly valid NFT with
+    ``execution reverted: Invalid token ID``. Observed live on mainnet twice,
+    while an immediate 20-call re-run passed 20/20 — so it is transient routing,
+    not bad state.
+
+    This matters more than a normal flaky read: the caller is deciding whether
+    to move real money, and a spurious revert mid-rebalance would abandon the
+    sequence between the withdraw and the re-mint. A permanent failure still
+    raises after the retries, so a genuinely bad token_id is not masked, just
+    slower to report.
+    """
+    import functools
+    import time as _time
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        last: Exception | None = None
+        for attempt in range(RPC_RETRIES):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 — retry any RPC-layer failure
+                last = e
+                if attempt < RPC_RETRIES - 1:
+                    _time.sleep(RPC_RETRY_SLEEP * (attempt + 1))
+        raise last  # type: ignore[misc]
+
+    return wrapped
+
+
+RPC_RETRIES = 3
+RPC_RETRY_SLEEP = 0.4
+
+
 def _cfg(network: str) -> dict[str, Any]:
     try:
         return ADDRESSES[network]
@@ -240,6 +277,7 @@ def _price_bounds_from_ticks(
 
 
 # --- Read-only chain queries (LLM-visible) -------------------------------------
+@_retry_rpc
 def get_bnb_price(network: str = "bsc-testnet") -> dict[str, Any]:
     """Current BNB price in USDT from the PancakeSwap V3 BNB/USDT pool.
 
@@ -264,6 +302,7 @@ def get_bnb_price(network: str = "bsc-testnet") -> dict[str, Any]:
     }
 
 
+@_retry_rpc
 def get_lp_position(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
     """Full PancakeSwap V3 LP position for an NFT ``token_id``.
 
@@ -340,6 +379,7 @@ def get_lp_current_range(token_id: int, network: str = "bsc-testnet") -> dict[st
     }
 
 
+@_retry_rpc
 def get_lp_liquidity(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
     """Liquidity of an LP position, alongside the pool's total active liquidity."""
     pos = get_lp_position(token_id, network)
@@ -355,6 +395,7 @@ def get_lp_liquidity(token_id: int, network: str = "bsc-testnet") -> dict[str, A
     }
 
 
+@_retry_rpc
 def get_pending_fees(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
     """Uncollected trading fees for an LP position, in both tokens.
 
@@ -466,6 +507,58 @@ def strategy_config() -> dict[str, Any]:
     return cfg
 
 
+def check_config_consistency(network: str | None = None) -> list[str]:
+    """Config that is internally inconsistent in ways nothing else catches.
+
+    Exists because of a real bug: switching ``[network].default`` to mainnet
+    left ``[payments.erc8183].currency`` at the scaffold's prefilled TESTNET
+    token, so the agent signed chain-56 quotes payable in a token that does not
+    exist on mainnet. Every layer was individually correct — only the
+    combination was wrong, and nothing was positioned to notice.
+
+    Returns a list of problem strings (empty when clean).
+    """
+    from bnbagent.networks import BNB_CHAIN_ADDRESSES
+
+    net = network or default_network()
+    problems: list[str] = []
+    try:
+        from bnbagent_studio_core import config as _config
+
+        cfg = _config.load_studio_toml() or {}
+    except Exception as e:  # noqa: BLE001
+        return [f"studio.toml unreadable: {e}"]
+
+    chain_id = {"bsc-mainnet": 56, "bsc-testnet": 97}.get(net)
+    if chain_id is None:
+        return [f"unknown network {net!r}"]
+
+    configured = str(
+        ((cfg.get("payments") or {}).get("erc8183") or {}).get("currency") or ""
+    )
+    expected = BNB_CHAIN_ADDRESSES[chain_id].payment_token
+    if configured and configured.lower() != expected.lower():
+        problems.append(
+            f"[payments.erc8183].currency {configured} is not the U token for "
+            f"{net} (chain {chain_id}); expected {expected}. Quotes would be "
+            f"signed for a token that does not exist on this chain."
+        )
+
+    token_id = int(((cfg.get("strategy") or {}).get("token_id")) or 0)
+    if token_id and net in ADDRESSES:
+        try:
+            pos = get_lp_position(token_id, net)
+            if not pos["is_managed_pair"]:
+                problems.append(
+                    f"[strategy].token_id {token_id} is not a BNB/USDT fee-"
+                    f"{ADDRESSES[net]['fee']} position on {net} — token IDs are "
+                    f"per-network and this one does not belong to this chain."
+                )
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"[strategy].token_id {token_id} unreadable on {net}: {e}")
+    return problems
+
+
 def managed_token_id() -> int:
     """The LP NFT this agent manages (``[strategy].token_id``).
 
@@ -562,6 +655,90 @@ def calculate_rebalance_range(
         "range_pct": range_pct,
         "lower_price": current_price * (1 - f),
         "upper_price": current_price * (1 + f),
+    }
+
+
+# --- Liquidity <-> token amounts (pure math) -----------------------------------
+# Standard V3 formulas. L and the returned amounts are all in RAW token units.
+#
+#   in range:   amount0 = L * (sqrtPb - sqrtP) / (sqrtP * sqrtPb)
+#               amount1 = L * (sqrtP - sqrtPa)
+#   below Pa:   entirely token0        above Pb: entirely token1
+#
+# Floats are fine here: these feed reporting (TVL/PnL) and the mint slippage
+# floor, never an exact transfer amount. The contract itself recomputes in
+# integer math — we never tell it an exact amount to move.
+def _sqrt_ratio_at_tick(tick: int) -> float:
+    return 1.0001 ** (tick / 2)
+
+
+def liquidity_to_amounts(
+    liquidity: int, sqrt_price_x96: int, tick_lower: int, tick_upper: int
+) -> tuple[int, int]:
+    """``(amount0_raw, amount1_raw)`` held by ``liquidity`` over the range."""
+    if liquidity <= 0:
+        return (0, 0)
+    sp = sqrt_price_x96 / (2**96)
+    sa, sb = _sqrt_ratio_at_tick(tick_lower), _sqrt_ratio_at_tick(tick_upper)
+    if sa > sb:
+        sa, sb = sb, sa
+
+    if sp <= sa:  # entirely token0
+        return (int(liquidity * (sb - sa) / (sa * sb)), 0)
+    if sp >= sb:  # entirely token1
+        return (0, int(liquidity * (sb - sa)))
+    return (int(liquidity * (sb - sp) / (sp * sb)), int(liquidity * (sp - sa)))
+
+
+def amounts_to_liquidity(
+    amount0: int, amount1: int, sqrt_price_x96: int, tick_lower: int, tick_upper: int
+) -> int:
+    """Liquidity mintable from the given amounts — whichever side binds.
+
+    Mirrors what NonfungiblePositionManager.mint does internally, so callers
+    can predict the deposit before sending it.
+    """
+    sp = sqrt_price_x96 / (2**96)
+    sa, sb = _sqrt_ratio_at_tick(tick_lower), _sqrt_ratio_at_tick(tick_upper)
+    if sa > sb:
+        sa, sb = sb, sa
+
+    if sp <= sa:
+        return int(amount0 * (sa * sb) / (sb - sa)) if sb > sa else 0
+    if sp >= sb:
+        return int(amount1 / (sb - sa)) if sb > sa else 0
+    l0 = amount0 * (sp * sb) / (sb - sp) if sb > sp else float("inf")
+    l1 = amount1 / (sp - sa) if sp > sa else float("inf")
+    liq = min(l0, l1)
+    return 0 if liq == float("inf") else int(liq)
+
+
+@_retry_rpc
+def get_position_value(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+    """Token amounts and USDT value (TVL) held by a position — spec 4.6 ``tvl``."""
+    cfg = _cfg(network)
+    pos = get_lp_position(token_id, network)
+    slot0 = _pool(network).functions.slot0().call()
+    d0 = _decimals(network, pos["token0"])
+    d1 = _decimals(network, pos["token1"])
+    amt0, amt1 = liquidity_to_amounts(
+        pos["liquidity"], int(slot0[0]), pos["tick_lower"], pos["tick_upper"]
+    )
+    price = _bnb_price_from_tick(int(slot0[1]), d0, d1)
+    usdt, bnb = amt0 / 10**d0, amt1 / 10**d1
+    if not pos["is_managed_pair"]:
+        # token0 is not USDT for this NFT, so naming the sides would be a lie.
+        return {"token_id": int(token_id), "network": network,
+                "is_managed_pair": False, "amount0": usdt, "amount1": bnb,
+                "warning": "not the managed BNB/USDT pair; amounts unlabelled"}
+    return {
+        "token_id": int(token_id),
+        "network": network,
+        "is_managed_pair": True,
+        "amount_usdt": usdt,
+        "amount_bnb": bnb,
+        "price_usdt_per_bnb": price,
+        "tvl_usdt": usdt + bnb * price,
     }
 
 

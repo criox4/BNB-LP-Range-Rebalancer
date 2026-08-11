@@ -1,0 +1,448 @@
+# BNB LP Range Rebalancer — Project Documentation
+
+Living record of what was built, why each decision was made the way it was, what
+is verified on-chain, and what remains. Spec reference throughout is
+`BNB Agent Studio Marketplace.md` (v1.0), cited as **§n**.
+
+**Last updated:** 2026-08-11
+**Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
+**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`
+
+---
+
+## 1. Status at a glance
+
+| | |
+|---|---|
+| Strategy logic | complete and exercised on both networks |
+| Testnet position | `36780` (rebalanced from `36779`) |
+| **Mainnet position** | **`7116214`** (rebalanced from `7116193`), live, in range |
+| Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
+| Monitor loop | runs inside the A2A runtime, 60s poll |
+| Runtime state | **paused** (will not trade unattended) |
+| Tests | 14 unit + live address-book / guard / config checks |
+| Blocked on credentials | AWS deploy, IPFS storage |
+| Blocked on a clean wallet | ERC-8004 identity |
+
+**§4.8 Definition of Done is met**: the agent reads a real PancakeSwap V3
+position, detects the rebalance condition, executes on BSC, the transaction
+confirms, the new position is verified, and the hash is returned. Done on
+testnet and then on mainnet with real funds.
+
+**§22 Final Acceptance is not met** and cannot be by this agent alone — it
+requires all four agents.
+
+---
+
+## 2. Requirements traceability
+
+### 2.1 Agent #1 specifics (§4)
+
+| Req | Requirement | Status | Where |
+|---|---|---|---|
+| §4.1 | PancakeSwap V3: Pool, Factory, NonfungiblePositionManager, QuoterV2, SwapRouter | **done** | `pancake.ADDRESSES`, `lp_signing.py` |
+| §4.2 | BNB/USDT only, v1 | **done** | single pool in config |
+| §4.3 | ±10% range, 5% trigger, configurable | **done** | `[strategy]` in `studio.toml` |
+| §4.4 | Monitor → detect → decrease → collect → swap → mint → verify | **done** | `strategy.rebalance()` |
+| §4.5 | 15 required tools | **done** | see 2.2 |
+| §4.6 | Marketplace data payload | **done** | `strategy.get_status()` |
+| §4.7 | activate / pause / rebalance / getStatus / getPosition / getPerformance | **done** | `strategy.ACTIONS` |
+| §4.8 | Definition of Done | **done, on mainnet** | §6 evidence below |
+
+### 2.2 §4.5 required tools
+
+| Spec tool | Implementation | Notes |
+|---|---|---|
+| `get_bnb_price()` | `pancake.get_bnb_price` | from pool `slot0` tick |
+| `get_lp_position(token_id)` | `pancake.get_lp_position` | + `is_managed_pair` guard |
+| `get_lp_current_range()` | `pancake.get_lp_current_range` | |
+| `get_lp_liquidity()` | `pancake.get_lp_liquidity` | + share of pool |
+| `get_pending_fees()` | `pancake.get_pending_fees` | via `collect` simulation |
+| `calculate_rebalance_range()` | `pancake.calculate_rebalance_range` | |
+| `calculate_rebalance_required()` | `pancake.calculate_rebalance_required` | |
+| `quote_swap()` | `lp_signing.quote_swap` | QuoterV2 |
+| `execute_swap()` | `lp_signing.execute_swap` | quote-derived floor |
+| `decrease_liquidity()` | `lp_signing.decrease_liquidity` | |
+| `collect_fees()` | `lp_signing.collect_fees` | |
+| `mint_position()` | `lp_signing.mint_position` | derived mins |
+| `verify_position()` | `pancake.get_position_summary` | called post-mint in `rebalance()` |
+
+### 2.3 Cross-cutting requirements (§3, §8–§17)
+
+| Req | Requirement | Status | Notes |
+|---|---|---|---|
+| §3.1 | LLM must never generate arbitrary calldata | **done** | §4.1 below; enforced + tested |
+| §8 | REST: `/health` `/status` `/strategy` `/performance` `/positions` `/transactions`, `POST /activate` `/pause` `/execute` | **NOT DONE** | we serve A2A JSON-RPC + `/ping`. See gap G1 |
+| §9 | Shared agent metadata JSON | **NOT DONE** | see gap G2 |
+| §10 | ERC-8004 identity | **partial** | testnet ID exists but describes another agent — gap G3 |
+| §11 | ERC-8183 service integration | **partial** | `negotiate` verified; `notify_funded` unproven — gap G4 |
+| §12 | Testnet for dev, mainnet for production | **done** | both exercised; `[network].default` switches |
+| §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **NOT DONE** | addresses are in `pancake.ADDRESSES`. See gap G5 |
+| §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **partial** | `history[]` has most; missing `agent_id`, `input/output_amount`, `error` — gap G6 |
+| §15 | Handle 10 named error classes | **partial** | see 2.4 |
+| §16 | Emergency stop; paused = no new transactions, reads continue | **done** | `pause()`; loop checks status each pass |
+| §17/§18 | Marketplace card fields | **partial** | TVL/PnL/utilization present; APR and 30D PnL absent — gap G7 |
+| §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source + testnet/mainnet execution done; no public URL |
+| §20 | README with 15 required sections | **NOT DONE** | gap G8 |
+
+### 2.4 §15 error handling coverage
+
+| Error class | Handled | How |
+|---|---|---|
+| Insufficient balance | yes | `mint_position.py` pre-flight, gas-price-derived reserve |
+| Insufficient allowance | yes | `approve_exact` before each spend |
+| Transaction reverted | yes | `eth_call` simulation before send; raises on receipt `status != 1` |
+| Slippage exceeded | yes | `amountOutMinimum` from live quote; mint floors |
+| Gas estimation failure | partial | fixed gas limits per op; no dynamic estimate retry |
+| RPC failure | yes | `_retry_rpc` on reads; monitor loop survives any pass failure |
+| Protocol unavailable | partial | surfaces as RPC/revert error |
+| Price data unavailable | yes | `get_status` returns `{error}` rather than throwing |
+| Invalid strategy config | yes | `check_config_consistency()` at boot; `managed_token_id()` raises |
+| Wallet unavailable | yes | `bag dev` refuses without `WALLET_PASSWORD` |
+
+No failed transaction disappears silently: every write raises with the tx hash,
+and the monitor logs exceptions with a stack trace (§15 closing requirement).
+
+---
+
+## 3. Architecture
+
+### 3.1 Layout
+
+```
+bnbLpRangeRebalancer/
+├── app/agent/
+│   ├── main.py            A2A entrypoint; boots config guard + monitor loop
+│   ├── executor.py        SellerAgentExecutor (scaffold) — negotiate/notify_funded
+│   ├── signing.py         ERC-8183 money ops (scaffold): quote-sign, submit, settle
+│   ├── lp_signing.py      ★ LP write path — wrap/approve/swap/mint/decrease/collect
+│   ├── pancake.py         ★ V3 reads + all range/tick/liquidity math
+│   ├── strategy.py        ★ monitor loop, six user actions, fee/PnL accounting
+│   ├── tools.py           the LLM-visible tool list (read-only ONLY)
+│   ├── mint_position.py   one-off position bootstrap
+│   ├── test_pancake.py    math tests + live chain checks
+│   └── studio.toml        network, wallet, LLM, ERC-8183 pricing, [strategy]
+├── agentcore/             AWS Bedrock AgentCore deploy config + CDK
+└── .studio/               keystore + .env.local — NEVER COMMITTED
+```
+★ = written for this agent; the rest is `bag init` scaffold.
+
+### 3.2 Control flow
+
+```
+        A2A (JSON-RPC :9000)                 background thread
+                │                                    │
+     negotiate / notify_funded              strategy._loop() every 60s
+                │                                    │
+                │                            strategy.check()
+         signing.py (fixed)                          │
+                │                        pancake.* (read-only, retried)
+                │                                    │
+                │                         rebalance_required?
+                │                                    │ yes
+                └──────────────┐             strategy.rebalance()
+                               │                     │
+                               ▼                     ▼
+                          get_wallet()  ◄──── lp_signing.* (fixed)
+                               │                     │
+                               ▼                     ▼
+                          BSC (chain 56 / 97)
+```
+
+### 3.3 The security boundary (§3.1)
+
+The spec forbids `LLM → arbitrary calldata → sign`. The implemented split:
+
+| Layer | Decides | Can it sign? |
+|---|---|---|
+| LLM | nothing that matters; reads status, writes prose | **no** |
+| `strategy.py` | *whether* to rebalance (deterministic) | no |
+| `lp_signing.py` | *what calldata* that means | yes — fixed code |
+
+Enforced concretely:
+- `tools.py` contains **only** read-only functions. A test asserts no
+  fund-moving or control function name appears in `LLM_READ_TOOLS`.
+- `activate` / `pause` / `rebalance` are **not** LLM tools. `rebalance` moves
+  funds; `activate`/`pause` control the loop that moves funds autonomously.
+  They are operator actions (`python strategy.py <action>`), so no prompt
+  injection can start, stop, or trigger the strategy.
+- `rebalance()` re-derives the decision from live chain state and refuses
+  unless genuinely due (`force=True` is the explicit §4.7 manual action).
+
+---
+
+## 4. Decision log
+
+Each entry: what was decided, and *why* — especially where the obvious choice
+is wrong.
+
+### 4.1 The LLM produces neither calldata nor figures
+§3.1 bans LLM-generated calldata. We extended the same principle to **numbers**
+after observing a real failure: handed the raw status dict, the model reported
+the raw V3 liquidity integer as *"TVL: 335,389.79 BNB"* (real TVL: **$0.81**)
+and invented pending-fee values ~1e12 too large. For a paid status report the
+numbers *are* the product, so `get_status_report()` formats every figure in
+code and the agent quotes it verbatim. The ambiguous `liquidity` key was renamed
+`liquidity_raw`. Re-verified: every figure matches exactly.
+
+### 4.2 token0 is USDT, so BNB price is INVERSE to the tick
+USDT sorts below WBNB on both networks, so the pool's `token0` is USDT. A V3
+tick prices token0 in token1, making the BNB price the reciprocal — and meaning
+**`tickLower` is the UPPER BNB price bound**. Every conversion funnels through
+`_bnb_price_from_tick` / `price_range_to_ticks` so the flip happens in exactly
+one place. Getting this backwards silently produces a range that never contains
+the price. Independently confirmed: mainnet reads ~$609 consistently across all
+four fee tiers, which only happens if the inversion is right.
+
+### 4.3 Every contract address verified on-chain, not from docs
+Required by §13 ("official documentation **or verified on-chain**"). This
+mattered: `docs.pancakeswap.finance` lists a BSC mainnet **Factory V3
+`0x1296b67b…` and Router V3 `0xEfF92A26…` that have no code on mainnet**, and
+lists them identically for Ethereum. The real mainnet factory is
+`0x0BFbCF9f…` — the same address as testnet. Two traps encoded in the table:
+
+- `position_manager` **differs** per network (testnet `0x427bF5b3`, mainnet
+  `0x46A15B0b`) even though the factory address is identical on both.
+- `quoter_v2` addresses are effectively **swapped**: both contracts exist on
+  both chains, but `0xbC203d7f` only answers on testnet and `0xB048Bbc1` only
+  on mainnet. The wrong one reverts with a bare `execution reverted: 0x`.
+
+`_live_addressbook()` calls every address on both chains so this cannot rot.
+
+### 4.4 The 5% trigger rule was derived, not assumed
+§4.3 says "Rebalance Trigger: 5%" and gives 763/637 for a 630–770 range.
+770−763 = 637−630 = 7 = **5% of the full range width (140)**. That is the only
+reading reproducing both numbers, so it is what `trigger_pct` means.
+`test_spec_example_triggers` pins it to the spec's own figures.
+
+### 4.5 `range_utilization` is our definition — the spec's is unreproducible
+§4.6 lists `range_utilization: 87` for price 704.21 in 630–770, but that is not
+derivable from those numbers by any reading we tried (linear position = 53%,
+log-space = 55.5%). We define it as **distance from centre**: 0% = dead centre,
+100% = sitting on a bound — the quantity that actually matters to a rebalancer.
+Documented in code. **Open question for the spec author.**
+
+### 4.6 `SigningPolicy` does not protect the LP path — so we wrote guards
+The SDK's `SigningPolicy` gates `sign_typed_data` (EIP-712) **only**.
+`sign_transaction` is unchecked, and every LP operation is a plain transaction.
+So the policy visible in `bag wallet policy` gives this path zero protection.
+`lp_signing.py` therefore carries the real boundary:
+- `_require_allowed` refuses any address outside the verified table
+- approvals are **exact-amount**, never unlimited (an unlimited router approval
+  is the classic way an agent wallet is drained later)
+- swaps carry a quote-derived `amountOutMinimum`; everything carries a deadline
+- gas price ceiling; `eth_call` simulation before every send
+
+### 4.7 Mint floors are derived, not a flat percentage
+`amount0Min/amount1Min` are computed by predicting the deposit the contract will
+actually take (`amounts_to_liquidity` → `liquidity_to_amounts`, the same math it
+uses internally), then flooring by `mint_slippage_pct`. A flat percentage of the
+*desired* amounts would revert every one-sided mint, because a range sitting off
+spot legitimately consumes almost none of one token. Pinned by
+`test_liquidity_amounts_out_of_range_is_single_sided`.
+
+### 4.8 `fees_24h` needs snapshots; the window flag is not optional
+Chain state exposes only fees pending *right now*, and rebalancing zeroes it by
+collecting. So the monitor samples its running total and differences the
+samples. Because the agent is blind before its first snapshot, the payload
+carries `fees_24h_window_complete` — under 24h of watching reports a floor and
+**says so** rather than passing a partial figure off as a full day.
+
+### 4.9 Per-network state and config
+`token_id` is network-specific: an ID minted on testnet names a different (or
+absent) position on mainnet. State files are `.lp_state.<network>.json` so
+testnet history is never read as mainnet money, and `check_config_consistency()`
+flags a `token_id` that does not belong to the active chain.
+
+### 4.10 Testnet sizes must stay small; mainnet economics are the opposite
+The testnet BNB/USDT pool is unarbitraged (~16 USDT/BNB) and shallow: swapping
+1 BNB moves it ~44%. At 0.01 BNB the impact is 0.5%. Mainnet is the reverse —
+gas is 0.05 gwei, so a full mint costs **$0.026** and a rebalance **$0.03**,
+while a $0.50 swap has 0.057% impact. This is why the $1 mainnet test is
+economically silly (3% of position per rebalance) but technically valid.
+
+### 4.11 Pool choice: fee-500 over the deeper fee-100
+The mainnet fee-100 pool is ~2× deeper, but a fixed position buys a *larger
+share* of the shallower fee-500 pool (2.1×) at a 5× higher fee rate — roughly
+10× the fee income per unit of volume. For a $1 position where the goal is
+observing fees at all, fee-500 wins. Recorded in `ADDRESSES` with the tradeoff.
+
+---
+
+## 5. Bug log
+
+Every one of these was found by running the thing, not by reading it.
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| B1 | Fee/BNB labels wrong for foreign positions | labelled by comparing `token0` to configured USDT; a foreign NFT decodes cleanly | `is_managed_pair`; refuse to name sides otherwise |
+| B2 | QuoterV2 testnet address reverted | assumed the same address on both chains | per-network quoter; live address-book test |
+| B3 | `nonce too low` mid-sequence | `get_transaction_count` defaulted to `latest`; node hadn't surfaced the prior tx | use `pending` |
+| B4 | **Principal booked as fee income** | read pending fees *after* `decreaseLiquidity`, which moves principal into `tokensOwed` — reported $0.154 "fees" on a $0.166 position | read fees **before** the decrease |
+| B5 | Gas reported as 7.2e-13 BNB | summed gas *units* as if wei | `_send` returns `gas_cost_wei` |
+| B6 | Mainnet gas reserve blocked a $1 position | flat 0.01 BNB headroom — trivial on testnet, ~$6 on mainnet | derive from live gas price |
+| B7 | **Mainnet quotes payable in the testnet token** | switching `[network].default` doesn't update `[payments.erc8183].currency`; scaffold prefills testnet | correct address + `check_config_consistency()` at boot |
+| B8 | Spurious `Invalid token ID` on a valid NFT | public BSC endpoints are load balanced; a lagging node reverts. Seen twice; an immediate 20-call rerun passed 20/20 | `_retry_rpc` on chain reads |
+| B9 | LLM misreported TVL and fees | raw integers + scientific notation handed to a model | code-formatted report, quoted verbatim (4.1) |
+
+B4, B5 and B9 were only observable *after* a real rebalance ran — a dry run
+would have shown none of them. B7 was only observable by calling `negotiate` and
+reading the signed terms back.
+
+---
+
+## 6. On-chain evidence
+
+Satisfies §19 "Blockchain Evidence" for testnet, and mainnet protocol
+interaction with a verified agent wallet.
+
+**Wallet:** `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b`
+
+### BSC Testnet (chain 97)
+| Action | Tx / ID |
+|---|---|
+| Mint → position `36779` | `98b1a8fe22a72f497983be3fd28dcde148f8ec5bca1b197a232d343774fa603e` |
+| Swap WBNB→USDT | `c0cd45744c29bb4596c163c9538bea8286878b58b5208082f0dd80f45d6c6e3e` |
+| Rebalance `36779`→`36780` | `28360b8b…`, `f875e01e…`, `befff314…` |
+| ERC-8004 agent id | `1796` (see gap G3) |
+
+### BSC Mainnet (chain 56)
+| Action | Tx / ID |
+|---|---|
+| Wrap BNB→WBNB | `220700c8659464b6d9dbfeb847ab83b324c534b8ec97f242f1315cbdc15cb432` |
+| Swap WBNB→USDT | `36c0ca812f0cf29bf44586ac74d715f1fcbba9308e045e72ceb83b3914f2dfbd` |
+| Mint → position `7116193` | `55fdd0a4d688be7eb12dd958146d018ebdfe88b059e6ffc2aa50fac4da9c5c3d` |
+| **Rebalance `7116193`→`7116214`** | `7068e8c3…`, `73890896…`, `4f2e4d57…` (gas $0.019) |
+
+Position `7116214`: range $548.22–$670.27, TVL ~$0.81, in range.
+TVL reconciles with the $0.85 committed once the swap fee and $0.04 of WBNB
+dust are accounted for.
+
+### Verified contract addresses
+
+| | BSC Mainnet (56) | BSC Testnet (97) |
+|---|---|---|
+| Factory | `0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865` | *same* |
+| PositionManager | `0x46A15B0b27311cedF172AB29E4f4766fbE7F4364` | `0x427bF5b37357632377eCbEC9de3626C71A5396c1` |
+| QuoterV2 | `0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997` | `0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2` |
+| SwapRouter | `0x1b81D678ffb9C0263b24A97847620C99d213eB14` | *same* |
+| WBNB | `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c` | `0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd` |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `0x337610d27c682E347C9cD60BD4b3b107C9d34dDd` |
+| Pool (fee 500) | `0x36696169C63e42cd08ce11f5deeBbCeBae652050` | `0x2dbB5a4c235164B9f772179A43faca2c71a8abDB` |
+| $U token | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565` |
+
+---
+
+## 7. Operations
+
+```bash
+cd bnbLpRangeRebalancer/app/agent
+export WALLET_PASSWORD=<password>          # never persisted to disk by design
+
+# Read-only
+.venv/bin/python strategy.py getStatus
+.venv/bin/python strategy.py getPosition
+.venv/bin/python strategy.py getPerformance
+
+# Control (operator only — deliberately NOT LLM tools)
+.venv/bin/python strategy.py activate
+.venv/bin/python strategy.py pause          # emergency stop, §16
+.venv/bin/python strategy.py rebalance          # only if genuinely due
+.venv/bin/python strategy.py rebalance --force  # manual, §4.7
+
+# Bootstrap a position
+.venv/bin/python mint_position.py --bnb 0.0014 --dry-run
+
+# Tests
+.venv/bin/python test_pancake.py            # 14 unit tests, no network
+.venv/bin/python test_pancake.py --live     # + live chain/address/guard checks
+
+# Full runtime (A2A + monitor loop)
+cd bnbLpRangeRebalancer && WALLET_PASSWORD=... ../.venv/bin/bag dev
+curl http://localhost:9000/ping
+curl http://localhost:9000/.well-known/agent-card.json
+```
+
+Switching networks: edit `[network].default`, set a `token_id` valid for that
+chain, and confirm `[payments.erc8183].currency` matches (the boot guard will
+say so if not).
+
+### Environment variables
+| Var | Purpose | Where |
+|---|---|---|
+| `WALLET_PASSWORD` | unlocks the keystore; sole signer | shell only — never written to disk |
+| `OPENROUTER_API_KEY` | LLM provider | `.studio/.env.local` (gitignored) |
+| `STUDIO_BSC_RPC` / `STUDIO_BSC_TESTNET_RPC` | RPC overrides | optional |
+
+---
+
+## 8. Security posture
+
+**Enforced**
+- Signing is fixed code; the LLM's tool list is read-only and asserted so.
+- Address allowlist on every write; exact-amount approvals; slippage floors;
+  gas ceiling; pre-send simulation.
+- Keystore lives at the workspace root outside the deploy code location and is
+  gitignored. Commits are scanned for key material before landing.
+- Paused = no new transactions (§16).
+
+**Known weaknesses — deliberate, tracked**
+1. **The wallet key was pasted in chat** and must be treated as compromised. It
+   is fine as a throwaway holding ~$1; move the position and any real balance to
+   a freshly generated key before scaling. The OpenRouter key was likewise
+   pasted and should be rotated.
+2. The wallet already carried an unrelated ERC-8004 identity (gap G3).
+3. `mint_slippage_pct` defaults to 1%; review before larger positions.
+4. Public RPC endpoints are unauthenticated and flaky (B8). Retries mitigate;
+   a paid endpoint would be better for production.
+
+---
+
+## 9. Tests
+
+`test_pancake.py` — 14 offline + 4 live groups.
+
+| Test | Guards against |
+|---|---|
+| `test_spec_example_range/_triggers` | drift from §4.3's own worked numbers |
+| `test_trigger_reasons` | out-of-range silently reading as "within" |
+| `test_range_metrics_geometry` | utilization/position math |
+| `test_degenerate_ranges_rejected` | inverted or zero-width ranges |
+| `test_tick_price_inversion/_roundtrip` | the token0 inversion (4.2) |
+| `test_snap_tick_direction` | tickSpacing rounding |
+| `test_price_range_maps_to_inverted_ticks` | lower price → upper tick |
+| `test_liquidity_amounts_roundtrip` | liquidity math vs the contract's |
+| `test_liquidity_amounts_out_of_range_is_single_sided` | why flat mint floors are wrong |
+| `test_zero_liquidity_has_no_amounts` | empty-position edge |
+| `test_fees_since_window_incompleteness_is_reported` | partial window sold as 24h |
+| `_live_addressbook` | every address on both chains; pool derives; quoter answers |
+| `_live_guards` | unlisted address refused before signing |
+| `_live_config_consistency` | wrong-chain currency (B7) — asserts the guard *fires* |
+| `_live_smoke` | foreign position refuses BNB/USDT labels |
+
+---
+
+## 10. Open items
+
+Ordered by what unblocks the most.
+
+| ID | Gap | Blocked by | Effort |
+|---|---|---|---|
+| **G1** | §8 REST interface (`/health`, `/status`, `/strategy`, `/performance`, `/positions`, `/transactions`, `POST /activate` `/pause` `/execute`) — we serve A2A JSON-RPC instead | nothing — pure code | medium |
+| **G2** | §9 shared metadata JSON endpoint | nothing | small |
+| **G3** | §10 ERC-8004 identity describes "fxagent" (prior use of this wallet); name/description are baked into the agentURI at registration and only endpoint/metadata are updatable | fresh wallet | small |
+| **G4** | §11 `notify_funded` never exercised end-to-end (verify → LLM work → storage → on-chain submit). The LLM work step *is* proven | a buyer funding a job in $U; wallet holds 0 U | medium |
+| **G5** | §13 shared `config/bsc-contracts.json`; addresses currently live in `pancake.ADDRESSES`. They *are* on-chain verified as §13 also demands, but the file layout is not as specified | nothing | small |
+| **G6** | §14 log fields `agent_id`, `input_amount`, `output_amount`, `error` missing from history entries | nothing | small |
+| **G7** | §17/§18 card fields APR and 30D PnL | needs longer history | medium |
+| **G8** | §20 README with the 15 required sections | nothing | small |
+| **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials | medium |
+| **G10** | §19 public service URL | G9 |  |
+| **G11** | Agents #2–4 (Grid §5, Yield §6, Lending Guardian §7). §21 puts Lending Guardian next | nothing | large |
+| **G12** | `range_utilization` definition needs confirming with the spec author (4.5) | an answer | trivial |
+
+**Note on §22**: final acceptance requires all four agents across eleven
+criteria. Agent #1 currently satisfies BNB Agent Studio, BSC Testnet, BSC
+Mainnet, Real protocol, Real blockchain data, Transaction execution,
+Transaction verification, Risk controls, and Pause/Emergency Stop. ERC-8004,
+ERC-8183 and Marketplace API remain (G3, G4, G1).

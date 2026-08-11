@@ -49,7 +49,7 @@ auto_settle = false                            # opt-in: detect dispute-window-e
 # configurable"). Read by pancake.py; edit here, not in code.
 pair = "BNB/USDT"
 fee = 500                  # pool fee tier in hundredths of a bip (500 = 0.05%)
-token_id = 7116193         # mainnet BNB/USDT position (minted 2026-08-11)
+token_id = 7116214  # mainnet BNB/USDT position (minted 2026-08-11)
                            # (testnet run used token_id 36780 — IDs are per-network)
 range_pct = 10.0           # target range half-width: +/-10% around spot
 trigger_pct = 5.0          # rebalance when price is within 5% OF RANGE WIDTH

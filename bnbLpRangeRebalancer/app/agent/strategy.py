@@ -460,11 +460,18 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
     risk.require_managed_position(pos, "rebalance")
 
     # Spec 14 log fields: what went IN to the rebalance, in token terms.
+    #
+    # The underlying amounts, NOT tokens_owed0/1. V3 only refreshes tokensOwed
+    # when the position is touched, so on an untouched position they read 0 and
+    # the log claimed a rebalance consumed nothing — while get_pending_fees(),
+    # which simulates a collect, showed real fees. get_position_value derives
+    # the amounts from liquidity at the live tick, which is what actually moves.
+    value = pcs.get_position_value(token_id, NETWORK)
     input_amount = {
-        "usdt": pos["tokens_owed0"] / 10 ** pcs._decimals(NETWORK, cfg["usdt"]),
-        "bnb": pos["tokens_owed1"] / 10 ** pcs._decimals(NETWORK, cfg["wbnb"]),
+        "usdt": value.get("amount_usdt", 0.0),
+        "bnb": value.get("amount_bnb", 0.0),
         "liquidity_raw": pos["liquidity"],
-        "tvl_usdt": pcs.get_position_value(token_id, NETWORK).get("tvl_usdt", 0.0),
+        "tvl_usdt": value.get("tvl_usdt", 0.0),
     }
 
     txs: list[str] = []

@@ -203,6 +203,70 @@ def test_fees_since_window_incompleteness_is_reported():
     assert _fees_since([], 86400, 5.0, 0.0, 600.0) == (0.0, False)
 
 
+def test_gas_limit_buffers_the_estimate_and_refuses_absurd_ones():
+    """Spec 15 gas estimation: buffer the node's number, cap the result.
+
+    The limit is not what you pay (that is gas USED) but it is what the balance
+    must cover, so an unbounded estimate from a broken node becomes a send the
+    wallet cannot afford.
+    """
+    import risk
+
+    assert risk.gas_limit_from_estimate(100_000) == 125_000
+    # A real mint (~900k) still fits under the ceiling.
+    assert risk.gas_limit_from_estimate(900_000) <= risk.MAX_GAS_LIMIT
+    try:
+        risk.gas_limit_from_estimate(risk.MAX_GAS_LIMIT)  # +25% is over the top
+        raise AssertionError("accepted a gas limit above the ceiling")
+    except RuntimeError as e:
+        assert "ceiling" in str(e), e
+
+
+def test_gas_estimation_failure_falls_back_instead_of_aborting():
+    """A failed ESTIMATE must not abort a rebalance mid-sequence.
+
+    Estimation is a node call and fails for reasons unrelated to the
+    transaction (a lagging or rate-limited RPC — B8). Aborting after
+    decrease_liquidity would leave the position dismantled, so this degrades to
+    the hand-set per-op limit. A CEILING breach is different and must propagate.
+    """
+    import lp_signing as lp
+
+    class _Boom:
+        fn_name = "mint"
+
+        def estimate_gas(self, _params):
+            raise RuntimeError("429 Too Many Requests")
+
+    assert lp._gas_limit(_Boom(), "0x" + "11" * 20, 0, fallback=900_000) == 900_000
+
+    class _Absurd:
+        fn_name = "mint"
+
+        def estimate_gas(self, _params):
+            return 50_000_000
+
+    try:
+        lp._gas_limit(_Absurd(), "0x" + "11" * 20, 0, fallback=900_000)
+        raise AssertionError("an absurd estimate was silently accepted")
+    except RuntimeError as e:
+        assert "ceiling" in str(e), e
+
+
+def test_protocol_unavailable_is_its_own_error_class():
+    """Spec 15 "protocol unavailable" must be distinguishable.
+
+    An RPC failure is worth retrying and a revert is worth reporting, but an
+    address with no code fails identically forever and the fix is config. The
+    address book records two such addresses from PancakeSwap's own docs.
+    """
+    import risk
+
+    assert issubclass(risk.ProtocolUnavailable, RuntimeError)
+    problems = risk.protocol_problems("no-such-network")
+    assert problems and "cannot reach" in problems[0], problems
+
+
 def _live_smoke():
     """Read-only smoke test against BSC testnet. Needs network."""
     from blockchain import get_bnb_price, get_lp_position, get_pending_fees

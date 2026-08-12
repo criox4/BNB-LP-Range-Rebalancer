@@ -15,7 +15,7 @@ runtime = "agentcore"
 protocol = "A2A"
 
 [network]
-default = "bsc-mainnet"
+default = "bsc-testnet"
 
 [wallet]
 # Local keystore signer. The Agent is the SOLE key-holder/signer.
@@ -35,11 +35,12 @@ model = "openai/gpt-4o-mini"
 # Read by the Agent: it quotes the FIXED `price`, CLAMPS it to [min,max],
 # freezes a short-TTL offer, and EIP-191 signs it — pricing is rule-based, the
 # LLM never prices.
-currency = "0xcE24439F2D9C6a2289F741120FE202248B666666"   # $U token on bsc-MAINNET (chain 56).
-# MUST match [network].default: the scaffold prefills the testnet token
-# (0xc70B8741... chain 97), and switching networks does NOT update it —
-# leaving it stale makes the agent sign mainnet quotes denominated in a
-# token that does not exist on mainnet.
+currency = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"   # $U token on bsc-TESTNET (chain 97).
+# MUST match [network].default. Switching networks does NOT update this line,
+# and a stale value makes the agent sign quotes for one chain denominated in a
+# token that only exists on the other — a signed, worthless quote (B7). The
+# mainnet token is 0xcE24439F2D9C6a2289F741120FE202248B666666 (chain 56).
+# check_config_consistency() compares the two at boot rather than trusting it.
 price = "100000000000000000"                   # wei — your list price (0.1 U); what every quote charges
 min_price = "0"                                # wei — clamp floor
 max_price = "1000000000000000000"              # wei — clamp ceiling (1 U = 10x list price)
@@ -53,9 +54,12 @@ auto_settle = false                            # opt-in: detect dispute-window-e
 # configurable"). Read by pancake.py; edit here, not in code.
 pair = "BNB/USDT"
 fee = 500                  # pool fee tier in hundredths of a bip (500 = 0.05%)
-token_id = 7116214  # mainnet BNB/USDT position (minted 2026-08-11)
-                           # (testnet position is 36799 — IDs are per-network, so
-                           #  switching [network].default means switching this too)
+token_id = 36799           # TESTNET BNB/USDT position (rebalanced from 36780)
+                           # Token IDs are per-network. The mainnet position is
+                           # 7116214; switching [network].default means switching
+                           # this line, [payments.erc8183].currency, and nothing
+                           # else — check_config_consistency() fails the boot if
+                           # the three disagree.
 range_pct = 10.0           # target range half-width: +/-10% around spot
 trigger_pct = 5.0          # rebalance when price is within 5% OF RANGE WIDTH
                            # of either bound (spec 4.3: 630-770 -> 637/763)
@@ -69,6 +73,9 @@ max_slippage_pct = 1.0     # swap guard; the testnet pool is shallow enough that
 kind = "local"
 
 [identity]
+# Written by `bag erc8004 register`. NOTE this records the MAINNET registration;
+# the ERC-8004 agent_id is per-network and testnet is 1796 (its agentURI is
+# frozen naming "fxagent" — see DOCUMENTATION.md 4.12).
 endpoint = "http://localhost:9000/.well-known/agent-card.json"
 registered_at = "2026-08-12T09:16:09.598559+00:00"
 agent_id = 265375

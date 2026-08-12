@@ -127,13 +127,42 @@ def _deadline() -> int:
 
 
 # --- Transaction plumbing ------------------------------------------------------
+def _gas_limit(fn, sender: str, value: int, fallback: int) -> int:
+    """Gas limit for a call: the node's estimate + headroom, else ``fallback``.
+
+    Spec 15 names "gas estimation failure" as its own error class. Estimation is
+    a node call and fails for reasons that have nothing to do with the
+    transaction — a lagging or rate-limited RPC (B8), or a state the estimator
+    cannot simulate. Falling back to the hand-set per-op limit degrades to the
+    previous behaviour instead of aborting a rebalance mid-sequence, where the
+    liquidity is already withdrawn and stopping is the expensive option.
+
+    A ceiling failure is NOT swallowed: that means the estimate itself was
+    absurd, which is a reason to stop rather than to proceed on a guess.
+    """
+    try:
+        estimate = fn.estimate_gas({"from": sender, "value": value})
+    except Exception as e:  # noqa: BLE001 — estimation is advisory, not a gate
+        log.warning("gas estimation failed for %s (%s); using fixed limit %s",
+                    getattr(fn, "fn_name", "?"), e, fallback)
+        return fallback
+    limit = risk.gas_limit_from_estimate(estimate)
+    log.debug("gas for %s: estimated %s, sending with %s",
+              getattr(fn, "fn_name", "?"), estimate, limit)
+    return limit
+
+
 def _send(network: str, fn, *, value: int = 0, gas: int = DEFAULT_GAS_LIMIT) -> dict[str, Any]:
-    """Build → sign → broadcast → wait for a contract call. Raises on revert."""
+    """Build → sign → broadcast → wait for a contract call. Raises on revert.
+
+    ``gas`` is the FALLBACK limit, used only when estimation fails.
+    """
     w3 = pcs._w3(network)
     wallet = get_wallet()
     sender = Web3.to_checksum_address(wallet.address)
 
     gas_price = risk.require_gas_price(w3)
+    gas = _gas_limit(fn, sender, value, fallback=gas)
 
     tx = fn.build_transaction({
         "from": sender,

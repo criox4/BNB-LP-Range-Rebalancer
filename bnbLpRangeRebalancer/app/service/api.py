@@ -117,6 +117,17 @@ def health() -> dict[str, Any]:
     if problems:
         out["status"] = "degraded"
 
+    # Spec 15 "protocol unavailable": an address with no code on this chain
+    # fails every call identically and forever, and reads as a confusing ABI
+    # error rather than a missing contract. Only checked when the RPC is up —
+    # otherwise every role reports a failure that is really the RPC's.
+    if out.get("rpc") == "up":
+        protocol = risk.protocol_problems(strat.NETWORK)
+        out["protocol_problems"] = protocol
+        out["protocol"] = "unavailable" if protocol else "up"
+        if protocol:
+            out["status"] = "degraded"
+
     out["monitor_running"] = strat.is_monitor_running()
     out["strategy_status"] = strat.load_state()["status"]
     return out

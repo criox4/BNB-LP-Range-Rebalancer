@@ -21,9 +21,10 @@ is verified on-chain, and what remains. Spec reference throughout is
 | **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
 | ERC-8004 testnet | `agent_id 1796` — agentURI frozen as `fxagent`; correct name in metadata |
 | Monitor loop | 60s poll; **opt-in** via `$AGENT_RUN_MONITOR` or `$SERVICE_RUN_MONITOR` — exactly one, never two hosts (§11) |
+| Active network | **bsc-testnet** — `[network].default` switched back for safe iteration; mainnet position `7116214` is untouched and paused |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 31 offline (14 math + 11 strategy + 6 service) + live address-book / guard / config checks |
+| Tests | 34 offline (17 math + 11 strategy + 6 service) + live address-book / guard / config checks |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
@@ -94,7 +95,7 @@ remaining project.
 | §12 | Testnet for dev, mainnet for production | **done** | both exercised; `[network].default` switches |
 | §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **done** | `blockchain._addresses` loads it; pool chosen by fee tier |
 | §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **done** | `history[]` entries carry `agent_id`, `action`, `input_amount`, `output_amount`, `gas_cost_wei`, `verified`, `error` |
-| §15 | Handle 10 named error classes | **partial** | see 2.4 |
+| §15 | Handle 10 named error classes | **done** | all ten; see 2.4 |
 | §16 | Emergency stop; paused = no new transactions, reads continue | **done** | `pause()`; loop checks status each pass |
 | §17/§18 | Marketplace card fields | **partial** | TVL/PnL/utilization present; APR and 30D PnL absent — gap G7 |
 | §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source, testnet + mainnet execution, and ERC-8004 IDs done; no public URL (needs AWS) |
@@ -108,9 +109,9 @@ remaining project.
 | Insufficient allowance | yes | `approve_exact` before each spend |
 | Transaction reverted | yes | `eth_call` simulation before send; raises on receipt `status != 1` |
 | Slippage exceeded | yes | `amountOutMinimum` from live quote; mint floors |
-| Gas estimation failure | partial | fixed gas limits per op; no dynamic estimate retry |
+| Gas estimation failure | yes | `eth_estimateGas` + 25% headroom, bounded by `risk.MAX_GAS_LIMIT`; falls back to the per-op fixed limit when estimation fails, so a lagging RPC cannot abort a rebalance mid-sequence |
 | RPC failure | yes | `_retry_rpc` on reads; monitor loop survives any pass failure |
-| Protocol unavailable | partial | surfaces as RPC/revert error |
+| Protocol unavailable | yes | `risk.ProtocolUnavailable` + `protocol_problems()` — `eth_getCode` per role; checked before any withdrawal and reported by `/health` |
 | Price data unavailable | yes | `get_status` returns `{error}` rather than throwing |
 | Invalid strategy config | yes | `check_config_consistency()` at boot; `managed_token_id()` raises |
 | Wallet unavailable | yes | `bag dev` refuses without `WALLET_PASSWORD` |

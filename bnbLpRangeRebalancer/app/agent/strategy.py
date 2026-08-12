@@ -469,6 +469,10 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
     :func:`_rebalance_lock`."""
     owner = Web3.to_checksum_address(get_wallet().address)
     cfg = pcs._cfg(NETWORK)
+    # Before anything is withdrawn: confirm the protocol is actually there.
+    # Failing here is free; failing after decrease_liquidity leaves the position
+    # dismantled with nowhere to mint it back.
+    risk.require_protocol_available(NETWORK)
     pos = pcs.get_lp_position(token_id, NETWORK)
     risk.require_position_owner(pos, owner)
     risk.require_managed_position(pos, "rebalance")

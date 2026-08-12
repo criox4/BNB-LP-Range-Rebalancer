@@ -47,11 +47,77 @@ log = logging.getLogger("seller-agent.risk")
 # rebalance should wait rather than proceed.
 MAX_GAS_PRICE_GWEI = 20
 
+# Ceiling on a single transaction's gas LIMIT. Paired with the price ceiling
+# above, this bounds what one transaction can cost: 20 gwei x 2M = 0.04 BNB.
+# Needed because the limit is now estimated from the node rather than fixed —
+# an absurd estimate (broken node, or a call that would loop) must not become an
+# absurd transaction. The largest real op here is mint at ~900k.
+MAX_GAS_LIMIT = 2_000_000
+
+# Headroom over the node's estimate. Estimation runs against the CURRENT state;
+# by the time the transaction lands, ticks may have moved and a swap may cross
+# an extra initialised tick. Too tight and it reverts out-of-gas after paying.
+GAS_ESTIMATE_BUFFER_PCT = 25
+
 # Contracts this agent may transact with, by role in the shared address book.
 # Anything else is refused before a transaction is built.
 ALLOWED_ROLES = (
     "factory", "position_manager", "quoter_v2", "swap_router", "wbnb", "usdt", "pool",
 )
+
+
+class ProtocolUnavailable(RuntimeError):
+    """A contract this agent depends on is not usable on this chain.
+
+    Spec 15 names "protocol unavailable" as its own error class, and it needs to
+    be distinguishable: an RPC failure is worth retrying, a reverting call is
+    worth reporting, but a protocol that is not deployed at the configured
+    address will fail identically forever, and the fix is config, not patience.
+
+    This is not hypothetical. ``config/bsc-contracts.json`` records two
+    addresses published in PancakeSwap's own docs that have NO CODE on mainnet,
+    and a QuoterV2 that answers on one network and not the other. Calling one of
+    those returns empty data, which web3 decodes as a confusing ABI error rather
+    than "this contract does not exist".
+    """
+
+
+def protocol_problems(network: str) -> list[str]:
+    """Roles in the address book with no contract code on ``network``.
+
+    One ``eth_getCode`` per role. Cheap enough for a health check, and the only
+    check that distinguishes "wrong address" from "bad call".
+    """
+    problems: list[str] = []
+    try:
+        cfg = chain._cfg(network)
+        w3 = chain._w3(network)
+    except Exception as e:  # noqa: BLE001
+        return [f"cannot reach {network}: {e}"]
+
+    for role in ALLOWED_ROLES:
+        address = cfg.get(role)
+        if not address:
+            problems.append(f"{role} missing from the address book for {network}")
+            continue
+        try:
+            if w3.eth.get_code(Web3.to_checksum_address(address)) in (b"", b"0x"):
+                problems.append(
+                    f"{role} {address} has no code on {network} — the address is "
+                    f"wrong for this chain, or the protocol is not deployed here"
+                )
+        except Exception as e:  # noqa: BLE001 — an RPC failure is a DIFFERENT class
+            problems.append(f"could not read code for {role} {address}: {e}")
+    return problems
+
+
+def require_protocol_available(network: str) -> None:
+    """Refuse to start a fund-moving sequence against a protocol that isn't there."""
+    problems = protocol_problems(network)
+    if problems:
+        raise ProtocolUnavailable(
+            f"PancakeSwap V3 is not usable on {network}: " + "; ".join(problems)
+        )
 
 
 # --- Address allowlist ---------------------------------------------------------
@@ -83,6 +149,22 @@ def require_gas_price(w3) -> int:
             f"{MAX_GAS_PRICE_GWEI} gwei ceiling — refusing to send"
         )
     return gas_price
+
+
+def gas_limit_from_estimate(estimate: int) -> int:
+    """Buffered gas limit for an estimate, refused if the result is absurd.
+
+    The limit is not what you pay — that is gas *used* — but it is what the
+    balance must cover, and an unbounded limit from a misbehaving node turns a
+    routine send into one the wallet cannot afford.
+    """
+    limit = int(estimate * (1 + GAS_ESTIMATE_BUFFER_PCT / 100.0))
+    if limit > MAX_GAS_LIMIT:
+        raise RuntimeError(
+            f"estimated gas {estimate} (+{GAS_ESTIMATE_BUFFER_PCT}% = {limit}) "
+            f"exceeds the {MAX_GAS_LIMIT} ceiling — refusing to send"
+        )
+    return limit
 
 
 # --- Position identity ----------------------------------------------------------

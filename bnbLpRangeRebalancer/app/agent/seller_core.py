@@ -86,7 +86,9 @@ class SellerCore:
     def __init__(self, *, run_work, generator: str, network: str | None = None) -> None:
         self._run_work = run_work
         self._generator = generator
-        self._network = network or "bsc-testnet"
+        # Latent B20: a literal fallback here is unreachable while main.py passes
+        # a network, and silently wrong the day something doesn't.
+        self._network = network or __import__("blockchain").default_network()
         # Background delivery bookkeeping (see notify_funded / is_busy):
         #  _tasks       — live background asyncio tasks (busy-status source).
         #  _inflight    — job ids in flight OR already terminally handled this

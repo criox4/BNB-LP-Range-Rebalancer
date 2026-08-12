@@ -24,7 +24,7 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Active network | selected by **`$BNB_NETWORK`** (§7), falling back to `[network].default`. Mainnet position `7116214` is untouched and paused |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 37 offline (19 math + 11 strategy + 7 service) + live address-book / guard / config checks |
+| Tests | 38 offline (20 math + 11 strategy + 7 service) + live address-book / guard / config checks |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
@@ -426,6 +426,7 @@ rebalance and then reading the record it wrote.
 |---|---|---|---|
 | B20 | **Every chain function defaulted to the literal `"bsc-testnet"`** | 17 signatures across `blockchain.py` and `lp_signing.py` carried `network: str = "bsc-testnet"`, including the whole write path (`mint`/`swap`/`decrease`/`collect`). Correct for as long as the agent only ran on testnet, so 35 tests and every prior run agreed with it. On mainnet the LLM called a tool without the argument, the read went to chain 97, and mainnet token `7116214` decoded to nothing — killing a **funded** delivery | `network: str | None = None` plus `network = network or default_network()` at every site, and `default_network()` now honours `$BNB_NETWORK` |
 | B21 | LLM invented `network='bsc'` | B20's fix made the parameter optional but left it *visible*, so the model still filled it in — with a value that is not a supported network | `tools.py` wraps the seven chain reads and exposes **neither** `network` nor a required `token_id`. §3.1 puts "what the action operates on" in deterministic code; the chain is part of that |
+| B20b | **The seller runtime kept its own network resolver** | found by re-checking B20 rather than trusting it closed. `main._default_network()` read `[network].default` itself with an `or "bsc-testnet"` fallback and never consulted `$BNB_NETWORK`; `seller_core.__init__` had the same literal. Exporting mainnet therefore moved the strategy while leaving the **seller polling testnet jobs** — a funded mainnet job would never be swept. The B20 test could not see it: it scans `def` lines, and this default lived in a body | both delegate to `blockchain.default_network()`; new source-scan test forbids a network fallback literal anywhere in the Agent Layer |
 | B22 | `range_pct`, `trigger_pct` and both slippage values silently reverted to defaults | mine: writing the new per-network map as a `[strategy.token_ids]` **table header** captured every `[strategy]` key below it. Caught by `test_service.py` before it ran | inline table on one line, with a comment saying why |
 
 B20 is the most expensive bug in this log, and the one the test suite was least

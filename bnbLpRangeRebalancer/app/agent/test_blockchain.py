@@ -329,6 +329,40 @@ def test_no_tool_defaults_to_a_hardcoded_network():
     )
 
 
+def test_only_blockchain_py_resolves_the_network():
+    """No second resolver for the active network, anywhere in the Agent Layer.
+
+    The signature scan above only sees defaults in a `def` line. main.py hid one
+    in a BODY — its own `[network].default` reader with an `or "bsc-testnet"`
+    fallback, which ignored $BNB_NETWORK entirely. Exporting mainnet therefore
+    moved the strategy while leaving the seller runtime polling testnet jobs, so
+    a funded mainnet job would never be swept. Same bug as B20, different blast
+    radius, and the fix is the same one: one resolver, everything else delegates.
+    """
+    import re
+    from pathlib import Path
+
+    here = Path(__file__).parent
+    # blockchain.py IS the resolver; the tests assert against literals on purpose.
+    exempt = {"blockchain.py", "test_blockchain.py"}
+    pattern = re.compile(r'or\s+["\']bsc-(testnet|mainnet)["\']')
+
+    offenders = []
+    for path in sorted(here.glob("*.py")):
+        if path.name in exempt:
+            continue
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            # [llm.pieverse].network is a DIFFERENT fact — which chain the LLM
+            # credit is bought on, not which chain the position lives on. This
+            # project runs OpenRouter, so that path is dead here either way.
+            if pattern.search(line) and "pieverse" not in line.lower():
+                offenders.append(f"{path.name}:{i}: {line.strip()}")
+    assert not offenders, (
+        "a hardcoded network fallback is a second source of truth — delegate to "
+        "blockchain.default_network(): " + "; ".join(offenders)
+    )
+
+
 def test_protocol_unavailable_is_its_own_error_class():
     """Spec 15 "protocol unavailable" must be distinguishable.
 

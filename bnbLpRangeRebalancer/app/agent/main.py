@@ -51,6 +51,7 @@ from bnbagent_studio_core.wallet import (
     ensure_twak_materialized,
 )
 
+import blockchain as pcs
 from agent_card import build_agent_card
 from executor import SellerAgentExecutor
 from tools import LLM_READ_TOOLS
@@ -212,13 +213,15 @@ async def _run_llm(prompt: str, *, session_id: str) -> str:
 
 
 def _default_network() -> str:
-    """studio.toml ``[network].default`` (best-effort; used by the funded sweep)."""
-    try:
-        from bnbagent_studio_core import config
+    """The active network for the seller runtime (job lookups, funded sweep).
 
-        return str(((config.load_studio_toml() or {}).get("network") or {}).get("default") or "bsc-testnet")
-    except Exception:  # noqa: BLE001
-        return "bsc-testnet"
+    Delegates to ``blockchain.default_network()`` rather than reading
+    ``[network].default`` itself — the scaffold's version ignored
+    ``$BNB_NETWORK``, so exporting mainnet moved the strategy while leaving the
+    seller polling testnet jobs. That is B20 with a different blast radius: a
+    second resolver for one fact will always drift from the first.
+    """
+    return pcs.default_network()
 
 
 # --- A2A surface --------------------------------------------------------------

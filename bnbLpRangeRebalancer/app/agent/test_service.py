@@ -97,6 +97,20 @@ def test_strategy_route_reports_configured_params_not_defaults():
     assert "mint_slippage_pct" in params, f"config not loaded from the agent: {params}"
 
 
+def test_monitor_liveness_is_observable_over_http():
+    """A completed monitor pass must be visible from outside the process.
+
+    Found by watching three real passes on testnet: the loop was checking and
+    persisting `last_check` to the state file, but neither /status nor /health
+    returned it, so a healthy monitor was indistinguishable from a dead one.
+    `monitor_running` does not cover this — a loop throwing on every pass still
+    reports the thread as alive.
+    """
+    for route in ("/status", "/health"):
+        body = client.get(route).json()
+        assert "last_check" in body, f"{route} cannot show whether a pass completed: {body}"
+
+
 def _live_read_routes():
     """Live: every read route answers 200 against the configured chain."""
     for route in READ_ROUTES:

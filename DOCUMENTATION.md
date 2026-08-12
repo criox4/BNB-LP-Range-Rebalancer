@@ -24,7 +24,7 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Active network | **bsc-testnet** — `[network].default` switched back for safe iteration; mainnet position `7116214` is untouched and paused |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 34 offline (17 math + 11 strategy + 6 service) + live address-book / guard / config checks |
+| Tests | 35 offline (17 math + 11 strategy + 7 service) + live address-book / guard / config checks |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
@@ -376,6 +376,14 @@ concurrency were not. That is the same shape as B4.
 | # | Bug | Root cause | Fix |
 |---|---|---|---|
 | B18 | §14 `input_amount` logged `0.0` for both tokens | read `pos["tokens_owed0"/"1"]`. V3 only refreshes `tokensOwed` when a position is *touched*, so on an untouched position both read zero — the log recorded a rebalance that consumed nothing, while `get_pending_fees()` (which simulates a `collect`) reported real fees on the same position | derive from `get_position_value` — liquidity → amounts at the live tick, i.e. what the withdrawal actually moves. That call was already being made for `tvl_usdt`, so the fix removes an RPC round trip rather than adding one |
+
+| B19 | Monitor liveness invisible over HTTP | `check()` persisted `last_check` on every pass, but `get_status()` never returned it and `/health` reported only `monitor_running` — which is thread liveness, so a loop throwing on every pass still reads as healthy. Three real passes on testnet looked identical to a dead monitor from outside the process | return `last_check` from `get_status()` and `/health`; `test_service.py` asserts both routes expose it |
+
+B19 was found by asking whether monitoring worked and checking rather than
+answering from the startup log. The loop was correct; the evidence that it was
+correct was not reachable from outside. That is its own class of bug — a
+component that works but cannot be observed to work is operationally the same as
+one that does not, because nothing can alert on it.
 
 B18 is the B4 family again: `tokensOwed` is a *lazily updated* field, and both
 bugs come from reading it at a moment when it does not mean what it looks like.

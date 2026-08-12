@@ -128,8 +128,14 @@ def health() -> dict[str, Any]:
         if protocol:
             out["status"] = "degraded"
 
+    # `monitor_running` is a thread liveness check and nothing more — a loop
+    # failing every pass still reports true. `last_check` is when a pass last
+    # COMPLETED, so a stale timestamp against an active strategy is the real
+    # "the monitor is wedged" signal.
+    state = strat.load_state()
     out["monitor_running"] = strat.is_monitor_running()
-    out["strategy_status"] = strat.load_state()["status"]
+    out["strategy_status"] = state["status"]
+    out["last_check"] = state["last_check"]
     return out
 
 

@@ -339,6 +339,11 @@ def get_status() -> dict[str, Any]:
         "gas_cost": gas_usdt,
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],
+        # Beyond spec 4.6, and the only evidence a monitor pass actually
+        # COMPLETED. `monitor_running` says a thread exists; a thread that
+        # throws on every pass still counts as running. This moves, or the loop
+        # is not doing its job — the field the operator should alert on.
+        "last_check": state["last_check"],
         "gas_cost_bnb": state["gas_spent_wei"] / 1e18,
     }
 

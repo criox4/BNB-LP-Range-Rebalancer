@@ -21,15 +21,15 @@ is verified on-chain, and what remains. Spec reference throughout is
 | **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
 | ERC-8004 testnet | `agent_id 1796` — agentURI frozen as `fxagent`; correct name in metadata |
 | Monitor loop | 60s poll; **opt-in** via `$AGENT_RUN_MONITOR` or `$SERVICE_RUN_MONITOR` — exactly one, never two hosts (§11) |
-| Active network | **bsc-testnet** — `[network].default` switched back for safe iteration; mainnet position `7116214` is untouched and paused |
+| Active network | selected by **`$BNB_NETWORK`** (§7), falling back to `[network].default`. Mainnet position `7116214` is untouched and paused |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 35 offline (17 math + 11 strategy + 7 service) + live address-book / guard / config checks |
+| Tests | 37 offline (19 math + 11 strategy + 7 service) + live address-book / guard / config checks |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
 | Blocked on a clean wallet | key rotation; a *production* ERC-8004 identity |
-| Blocked on the kernel | ERC-8183 `notify_funded` — buyer path reverts `PolicyNotWhitelisted()` |
+| **ERC-8183** | **closed on mainnet** — job `56587` reached `SUBMITTED`; the testnet buyer path stays blocked (§4.13) |
 
 **§4.8 Definition of Done is met**: the agent reads a real PancakeSwap V3
 position, detects the rebalance condition, executes on BSC, the transaction
@@ -37,11 +37,9 @@ confirms, the new position is verified, and the hash is returned. Done on
 testnet and then on mainnet with real funds.
 
 **§22 Final Acceptance is not met** and cannot be by this agent alone — it
-requires all four agents. For Agent #1 specifically, Marketplace API and
-**ERC-8004 are now satisfied on both networks**. **ERC-8183** is the one
-criterion still outstanding: the seller half is verified (a wallet-signed quote,
-§11), but `notify_funded` needs a funded job, and the buyer path is gated —
-see §10.
+requires all four agents. For Agent #1 specifically, Marketplace API, **ERC-8004
+on both networks** and now **ERC-8183 on mainnet** are all satisfied: the full
+lifecycle ran end to end (§6). What remains for this agent is hosting, not code.
 
 **Every spec requirement that could be closed by writing code has been closed.**
 What remains needs AWS credentials, a whitelisted buyer policy, elapsed time, or
@@ -422,6 +420,21 @@ B4 read it after a decrease, when it held principal; B18 read it before any
 interaction, when it held nothing. Neither is visible without executing a
 rebalance and then reading the record it wrote.
 
+### Round 4 — found by running a paid job on mainnet
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| B20 | **Every chain function defaulted to the literal `"bsc-testnet"`** | 17 signatures across `blockchain.py` and `lp_signing.py` carried `network: str = "bsc-testnet"`, including the whole write path (`mint`/`swap`/`decrease`/`collect`). Correct for as long as the agent only ran on testnet, so 35 tests and every prior run agreed with it. On mainnet the LLM called a tool without the argument, the read went to chain 97, and mainnet token `7116214` decoded to nothing — killing a **funded** delivery | `network: str | None = None` plus `network = network or default_network()` at every site, and `default_network()` now honours `$BNB_NETWORK` |
+| B21 | LLM invented `network='bsc'` | B20's fix made the parameter optional but left it *visible*, so the model still filled it in — with a value that is not a supported network | `tools.py` wraps the seven chain reads and exposes **neither** `network` nor a required `token_id`. §3.1 puts "what the action operates on" in deterministic code; the chain is part of that |
+| B22 | `range_pct`, `trigger_pct` and both slippage values silently reverted to defaults | mine: writing the new per-network map as a `[strategy.token_ids]` **table header** captured every `[strategy]` key below it. Caught by `test_service.py` before it ran | inline table on one line, with a comment saying why |
+
+B20 is the most expensive bug in this log, and the one the test suite was least
+able to see: a default that is right on the network you develop on is
+indistinguishable from a correct default until the day you switch. It is also
+why `$BNB_NETWORK` exists — the network was previously *three* coupled edits
+(`[network].default`, `token_id`, `currency`), and B7 and B22 are both what
+happens when one of the three drifts.
+
 ---
 
 ## 6. On-chain evidence
@@ -463,6 +476,7 @@ this does not arise (see §4.10).
 | Mint → position `7116193` | `55fdd0a4d688be7eb12dd958146d018ebdfe88b059e6ffc2aa50fac4da9c5c3d` |
 | **Rebalance `7116193`→`7116214`** | `7068e8c3…`, `73890896…`, `4f2e4d57…` (gas $0.019) |
 | **ERC-8004 registration** | `agent_id 265375`, registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` |
+| **ERC-8183 job `56587` submitted** | `4bd0271912b1dc9aa2e7f80c9b858db5d4ba3481401f2ff146a72ea9417d6836` (block 115539760) |
 
 Position `7116214`: range $548.22–$670.27, TVL ~$0.81, in range.
 TVL reconciles with the $0.85 committed once the swap fee and $0.04 of WBNB
@@ -523,6 +537,7 @@ say so if not).
 ### Environment variables
 | Var | Purpose | Where |
 |---|---|---|
+| `BNB_NETWORK` | `bsc-mainnet` / `bsc-testnet` — moves the chain **and** the managed position together (`[strategy].token_ids` maps one per network). Rejects unknown values rather than falling back. It cannot move `[payments.erc8183].currency`, which the SDK reads from studio.toml itself — `check_config_consistency()` says so explicitly when both are set | overrides `[network].default` |
 | `WALLET_PASSWORD` | unlocks the keystore; sole signer | shell only — never written to disk |
 | `OPENROUTER_API_KEY` | LLM provider | `.studio/.env.local` (gitignored) |
 | `SERVICE_API_KEY` | gates `/activate` `/pause` `/execute`; unset ⇒ they 503 | required to control the agent over HTTP |
@@ -621,7 +636,8 @@ on something external.
 |---|---|---|
 | **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. Acceptable while the wallet holds $0.81 of a throwaway position; not acceptable before real value | a decision |
 | **G3** | §10 ERC-8004 **production** identity. Both networks are now registered, but on the compromised wallet and with a `localhost` endpoint frozen into the agentURI (see §4.12). The mainnet record is deliberately named `BNB LP Rebalancer (Test)` | a fresh wallet (G13) **and** a public URL (G10) — register last, not first |
-| **G4** | §11 `notify_funded` end-to-end. `negotiate` **is** verified (wallet-signed quote, chain 97). The buyer leg reverts `PolicyNotWhitelisted()` — **root-caused, see §4.13: the SDK's policy is whitelisted on mainnet and NOT on testnet.** Not fixable by us; `setPolicyWhitelist` is owner-only | running the flow on **mainnet** (needs buyer $U), or the SDK operators whitelisting the testnet policy |
+| **G14** | Settle job `56587` (`approve` → `COMPLETED`). Calling it early reverts `0x17be5b7b` | the 24h dispute window |
+| **G15** | `deliverable_url` points at `localhost` — a real buyer cannot fetch it. Only the on-chain record is portable today | G9 (IPFS storage) |
 | **G7** | §17/§18 card fields APR and 30D PnL | elapsed time — the agent has been watching under 24h |
 | **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials |
 | **G10** | §19 public service URL | G9 |
@@ -642,6 +658,7 @@ on something external.
 | — | §22 ERC-8004 row, both networks | mainnet `agent_id 265375`; testnet `1796` with corrected metadata |
 | — | §14 log fields *demonstrated* | testnet rebalance `36780`→`36799` is the first entry carrying the full set |
 | — | B18 `input_amount` logged zeros | derived from `get_position_value`, not `tokensOwed` (§5 bug log) |
+| ~~G4~~ | §11 `notify_funded` end-to-end | **mainnet job `56587`**: `negotiate` over A2A → `create` → `register` → `set_budget` → `fund` → `notify_funded` → on-chain `submit`, `SUBMITTED` (§6). `register` is the step that reverts on testnet, which confirms §4.13 exactly. Two things the flow required and nothing documented: `ERC8183_AGENT_URL` must point at the seller's `/erc8183` mount, and the budget must **equal** the quoted price, not exceed it |
 
 **Note on G13.** Rotating is cheap; the ordering is what costs. The correct
 sequence is now: **new wallet → fund → deploy (G9/G10) → register ERC-8004 with

@@ -34,6 +34,7 @@ Each check exists because of a specific way this agent could lose funds:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from web3 import Web3
@@ -251,10 +252,19 @@ def check_config_consistency(network: str | None = None) -> list[str]:
     )
     expected = BNB_CHAIN_ADDRESSES[chain_id].payment_token
     if configured and configured.lower() != expected.lower():
+        hint = ""
+        if os.environ.get("BNB_NETWORK"):
+            # The env override moves this module's network but NOT the SDK's
+            # currency, which it reads from studio.toml directly. Say so, or the
+            # operator reasonably assumes one switch moved everything.
+            hint = (
+                f" Note $BNB_NETWORK={net} set the network, but it cannot move "
+                f"this line — the SDK reads it from studio.toml."
+            )
         problems.append(
             f"[payments.erc8183].currency {configured} is not the U token for "
             f"{net} (chain {chain_id}); expected {expected}. Quotes would be "
-            f"signed for a token that does not exist on this chain."
+            f"signed for a token that does not exist on this chain.{hint}"
         )
 
     # The shared address book must agree with the network we think we're on.
@@ -269,7 +279,10 @@ def check_config_consistency(network: str | None = None) -> list[str]:
         except Exception as e:  # noqa: BLE001
             problems.append(f"address book unreadable for {net}: {e}")
 
-    token_id = int(((cfg.get("strategy") or {}).get("token_id")) or 0)
+    try:
+        token_id = chain.managed_token_id(net)
+    except ValueError:
+        token_id = 0
     if token_id and net in chain.supported_networks():
         try:
             pos = chain.get_lp_position(token_id, net)

@@ -153,6 +153,10 @@ def strategy_config() -> Any:
     """Active strategy parameters (spec 4.3) and what they currently imply."""
     try:
         cfg = dict(chain.strategy_config())
+        # token_ids is a per-network map; report the one actually in force so
+        # the API answers "which position is this agent managing right now"
+        # rather than making the caller resolve it.
+        cfg["token_id"] = strat.current_token_id()
         price = chain.get_bnb_price(strat.NETWORK)["price_usdt_per_bnb"]
         target = chain.calculate_rebalance_range(price, float(cfg["range_pct"]))
         metrics = chain.calculate_range_metrics(

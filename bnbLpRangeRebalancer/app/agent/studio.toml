@@ -15,7 +15,7 @@ runtime = "agentcore"
 protocol = "A2A"
 
 [network]
-default = "bsc-testnet"
+default = "bsc-mainnet"
 
 [wallet]
 # Local keystore signer. The Agent is the SOLE key-holder/signer.
@@ -35,7 +35,7 @@ model = "openai/gpt-4o-mini"
 # Read by the Agent: it quotes the FIXED `price`, CLAMPS it to [min,max],
 # freezes a short-TTL offer, and EIP-191 signs it — pricing is rule-based, the
 # LLM never prices.
-currency = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"   # $U token on bsc-TESTNET (chain 97).
+currency = "0xcE24439F2D9C6a2289F741120FE202248B666666"   # $U token on bsc-MAINNET (chain 56).
 # MUST match [network].default. Switching networks does NOT update this line,
 # and a stale value makes the agent sign quotes for one chain denominated in a
 # token that only exists on the other — a signed, worthless quote (B7). The
@@ -54,12 +54,14 @@ auto_settle = false                            # opt-in: detect dispute-window-e
 # configurable"). Read by pancake.py; edit here, not in code.
 pair = "BNB/USDT"
 fee = 500                  # pool fee tier in hundredths of a bip (500 = 0.05%)
-token_id = 36799           # TESTNET BNB/USDT position (rebalanced from 36780)
-                           # Token IDs are per-network. The mainnet position is
-                           # 7116214; switching [network].default means switching
-                           # this line, [payments.erc8183].currency, and nothing
-                           # else — check_config_consistency() fails the boot if
-                           # the three disagree.
+
+# Token IDs are per-network: an ID minted on one chain names a different (or
+# missing) position on the other. Listing both means switching chains is just
+# $BNB_NETWORK — no edit here, which is what kept drifting when it was one line.
+# INLINE table on purpose: a [strategy.token_ids] header would capture every
+# key below it, silently moving range_pct/trigger_pct/slippage out of [strategy].
+token_ids = { bsc-mainnet = 7116214, bsc-testnet = 36799 }
+
 range_pct = 10.0           # target range half-width: +/-10% around spot
 trigger_pct = 5.0          # rebalance when price is within 5% OF RANGE WIDTH
                            # of either bound (spec 4.3: 630-770 -> 637/763)

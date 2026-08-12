@@ -203,8 +203,9 @@ def _contract(network: str, address: str, abi: list):
 
 
 # --- Operations ----------------------------------------------------------------
-def wrap_bnb(amount_wei: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def wrap_bnb(amount_wei: int, network: str | None = None) -> dict[str, Any]:
     """Wrap native tBNB/BNB into WBNB (the pool trades WBNB, not native)."""
+    network = network or pcs.default_network()
     if amount_wei <= 0:
         raise ValueError("amount_wei must be positive")
     wbnb = _contract(network, pcs._cfg(network)["wbnb"], WBNB_ABI)
@@ -212,11 +213,12 @@ def wrap_bnb(amount_wei: int, network: str = "bsc-testnet") -> dict[str, Any]:
 
 
 def approve_exact(token: str, spender: str, amount_wei: int,
-                  network: str = "bsc-testnet") -> dict[str, Any] | None:
+                  network: str | None = None) -> dict[str, Any] | None:
     """Approve EXACTLY ``amount_wei`` — never unlimited.
 
     Returns None when the existing allowance already covers the amount.
     """
+    network = network or pcs.default_network()
     if amount_wei <= 0:
         raise ValueError("amount_wei must be positive")
     wallet_addr = Web3.to_checksum_address(get_wallet().address)
@@ -233,8 +235,9 @@ def approve_exact(token: str, spender: str, amount_wei: int,
 
 
 def quote_swap(token_in: str, token_out: str, amount_in_wei: int,
-               network: str = "bsc-testnet") -> int:
+               network: str | None = None) -> int:
     """Live quote for an exact-input single-pool swap. Read-only (``eth_call``)."""
+    network = network or pcs.default_network()
     cfg = pcs._cfg(network)
     quoter = _contract(network, cfg["quoter_v2"], QUOTER_ABI)
     out = quoter.functions.quoteExactInputSingle((
@@ -247,7 +250,7 @@ def quote_swap(token_in: str, token_out: str, amount_in_wei: int,
 
 def execute_swap(token_in: str, token_out: str, amount_in_wei: int,
                  max_slippage_pct: float | None = None,
-                 network: str = "bsc-testnet") -> dict[str, Any]:
+                 network: str | None = None) -> dict[str, Any]:
     """Swap exact input through the V3 SwapRouter with a quote-derived floor.
 
     ``amountOutMinimum`` comes from a live quote minus ``max_slippage_pct``, so
@@ -256,6 +259,7 @@ def execute_swap(token_in: str, token_out: str, amount_in_wei: int,
     price impact — the guard bounds movement between quote and execution, not
     the impact of the trade size. Keep test sizes small.
     """
+    network = network or pcs.default_network()
     cfg = pcs._cfg(network)
     if max_slippage_pct is None:
         max_slippage_pct = risk.slippage_pct("swap")
@@ -280,7 +284,7 @@ def execute_swap(token_in: str, token_out: str, amount_in_wei: int,
 def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
                   lower_price: float, upper_price: float,
                   amount0_min: int | None = None, amount1_min: int | None = None,
-                  network: str = "bsc-testnet") -> dict[str, Any]:
+                  network: str | None = None) -> dict[str, Any]:
     """Mint a new concentrated-liquidity position over a BNB price range.
 
     ``lower_price``/``upper_price`` are USDT per BNB; the tick conversion (and
@@ -294,6 +298,7 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
     one side of spot the contract legitimately consumes almost none of one
     token, so a naive floor would revert every such mint.
     """
+    network = network or pcs.default_network()
     cfg = pcs._cfg(network)
     ticks = pcs.price_range_to_ticks(lower_price, upper_price, network)
     recipient = Web3.to_checksum_address(get_wallet().address)
@@ -343,7 +348,7 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
 
 def increase_liquidity(token_id: int, amount_usdt_wei: int, amount_wbnb_wei: int,
                        amount0_min: int | None = None, amount1_min: int | None = None,
-                       network: str = "bsc-testnet") -> dict[str, Any]:
+                       network: str | None = None) -> dict[str, Any]:
     """Add liquidity to the EXISTING position, keeping its range and its NFT.
 
     Spec 4.1 lists ``increaseLiquidity()`` among the required LP operations. The
@@ -354,6 +359,7 @@ def increase_liquidity(token_id: int, amount_usdt_wei: int, amount_wbnb_wei: int
 
     Mins are derived exactly as in :func:`mint_position`.
     """
+    network = network or pcs.default_network()
     if amount_usdt_wei <= 0 and amount_wbnb_wei <= 0:
         raise ValueError("nothing to add: both amounts are zero")
     cfg = pcs._cfg(network)
@@ -390,7 +396,7 @@ def increase_liquidity(token_id: int, amount_usdt_wei: int, amount_wbnb_wei: int
 
 def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = None,
                        amount1_min: int | None = None,
-                       network: str = "bsc-testnet") -> dict[str, Any]:
+                       network: str | None = None) -> dict[str, Any]:
     """Remove ``liquidity`` from a position. Tokens land in the position's
     owed balance — ``collect_fees`` then sweeps them to the wallet.
 
@@ -402,6 +408,7 @@ def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = 
     the position pay out entirely in whichever token just became the cheap side,
     then restores the price. Pass 0 explicitly to opt out.
     """
+    network = network or pcs.default_network()
     if liquidity <= 0:
         raise ValueError("liquidity must be positive")
     pos = pcs.get_lp_position(token_id, network)
@@ -425,9 +432,10 @@ def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = 
     ), gas=400_000)
 
 
-def collect_fees(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def collect_fees(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Sweep all owed tokens (accrued fees + anything freed by
     ``decrease_liquidity``) from the position to the wallet."""
+    network = network or pcs.default_network()
     pos = pcs.get_lp_position(token_id, network)
     risk.require_managed_position(pos, "collect")
     npm = _contract(network, pcs._cfg(network)["position_manager"], NPM_WRITE_ABI)

@@ -32,19 +32,83 @@ from bnbagent_studio_core.tools import chain_readonly as cr
 
 import blockchain as pcs
 
+# --- LLM-facing wrappers -------------------------------------------------------
+# The underlying functions take `network` and `token_id`. NEITHER is exposed to
+# the model:
+#
+#   network  — a config fact, not a decision. Left visible, the model fills it
+#              in: a real mainnet delivery died on `network='bsc'`, a value it
+#              invented (B21). Spec 3.1 says deterministic code decides what the
+#              action operates on; the chain is part of that.
+#   token_id — defaults to the managed position. The NFT contract holds EVERY V3
+#              position on the chain, so a hallucinated id reads a stranger's.
+#              Still accepted, so the model can be asked about a specific one,
+#              and still guarded by `is_managed_pair` downstream.
+#
+# Docstrings here are what the model sees, so they say what the tool returns
+# rather than how it is wired.
+def _managed(token_id: int | None) -> int:
+    return int(token_id) if token_id else strat_token_id()
+
+
+def strat_token_id() -> int:
+    import strategy
+    return strategy.current_token_id()
+
+
+def get_bnb_price() -> dict:
+    """Current BNB price in USDT, read from the PancakeSwap V3 pool tick."""
+    return pcs.get_bnb_price()
+
+
+def get_lp_position(token_id: int | None = None) -> dict:
+    """Raw LP position: token pair, fee tier, tick bounds, liquidity, owed fees.
+
+    Defaults to the position this agent manages.
+    """
+    return pcs.get_lp_position(_managed(token_id))
+
+
+def get_lp_current_range(token_id: int | None = None) -> dict:
+    """The position's price range in USDT per BNB, and whether price is inside it."""
+    return pcs.get_lp_current_range(_managed(token_id))
+
+
+def get_lp_liquidity(token_id: int | None = None) -> dict:
+    """The position's liquidity and its share of the pool's active liquidity."""
+    return pcs.get_lp_liquidity(_managed(token_id))
+
+
+def get_pending_fees(token_id: int | None = None) -> dict:
+    """Uncollected fees, in USDT and BNB, from a simulated `collect`."""
+    return pcs.get_pending_fees(_managed(token_id))
+
+
+def get_position_summary(token_id: int | None = None) -> dict:
+    """One call for the whole picture: price, range, utilization, liquidity,
+    pending fees, and whether a rebalance is currently required."""
+    return pcs.get_position_summary(_managed(token_id))
+
+
+def verify_position(token_id: int | None = None, tx_hash: str | None = None) -> dict:
+    """Re-read chain state and check the position exists, is the managed pair,
+    is owned by this agent, holds liquidity, and is in range (spec 4.5 / 4.8)."""
+    return pcs.verify_position(_managed(token_id), tx_hash)
+
+
 # PancakeSwap V3 reads for the managed BNB/USDT LP position. All are eth_calls
 # (`collect` is only ever simulated, never sent). The rebalance write path —
 # decreaseLiquidity / collect / swap / mint — stays fixed code in signing.py and
 # must NOT be added here; see spec section 3, which forbids the LLM from
 # producing calldata.
 LP_READ_TOOLS = [
-    FunctionTool(pcs.get_bnb_price),
-    FunctionTool(pcs.get_lp_position),
-    FunctionTool(pcs.get_lp_current_range),
-    FunctionTool(pcs.get_lp_liquidity),
-    FunctionTool(pcs.get_pending_fees),
-    FunctionTool(pcs.get_position_summary),
-    FunctionTool(pcs.verify_position),   # spec 4.5 / 4.8 — read-only re-check
+    FunctionTool(get_bnb_price),
+    FunctionTool(get_lp_position),
+    FunctionTool(get_lp_current_range),
+    FunctionTool(get_lp_liquidity),
+    FunctionTool(get_pending_fees),
+    FunctionTool(get_position_summary),
+    FunctionTool(verify_position),       # spec 4.5 / 4.8 — read-only re-check
     # Pure math — no chain access, safe for the LLM to explore hypotheticals with.
     FunctionTool(pcs.calculate_range_metrics),
     FunctionTool(pcs.calculate_rebalance_required),

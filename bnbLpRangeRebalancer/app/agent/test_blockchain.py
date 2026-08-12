@@ -253,6 +253,82 @@ def test_gas_estimation_failure_falls_back_instead_of_aborting():
         assert "ceiling" in str(e), e
 
 
+def test_bnb_network_env_switches_chain_and_token_id_together():
+    """$BNB_NETWORK moves the network AND the token_id in one step.
+
+    Switching by hand meant editing three coupled lines; getting one wrong is
+    B7, and the comments drifted twice while testing. The token_id must follow
+    automatically, because a mainnet id on testnet is exactly the "Invalid
+    token ID" that B20 produced.
+    """
+    import os
+
+    import blockchain as chain
+
+    def switch(net):
+        # default_network() is lru_cached on purpose — one network per process,
+        # and strategy.NETWORK is captured at import. So the env var is read at
+        # startup, and a test that changes it must clear the cache.
+        os.environ["BNB_NETWORK"] = net
+        chain.default_network.cache_clear()
+
+    saved = os.environ.pop("BNB_NETWORK", None)
+    try:
+        ids = {}
+        for net in ("bsc-testnet", "bsc-mainnet"):
+            switch(net)
+            assert chain.default_network() == net
+            ids[net] = chain.managed_token_id()
+            assert ids[net] > 0, net
+        assert ids["bsc-testnet"] != ids["bsc-mainnet"], \
+            f"both networks resolved to one token_id: {ids}"
+
+        # A typo must fail loudly, not silently fall back to a default chain.
+        switch("bsc-mainet")
+        try:
+            chain.default_network()
+            raise AssertionError("accepted an unsupported $BNB_NETWORK")
+        except ValueError as e:
+            assert "not a supported network" in str(e), e
+    finally:
+        os.environ.pop("BNB_NETWORK", None)
+        if saved is not None:
+            os.environ["BNB_NETWORK"] = saved
+        chain.default_network.cache_clear()
+
+
+def test_no_tool_defaults_to_a_hardcoded_network():
+    """Every network-taking function must default to the CONFIGURED network.
+
+    B20: all 17 of these defaulted to the literal "bsc-testnet". Harmless while
+    the agent ran on testnet, and invisible in tests for the same reason — but
+    on mainnet the LLM calls a tool without a network argument, the call goes to
+    chain 97, and a mainnet token_id decodes to nothing: "Invalid token ID".
+    It killed a real funded ERC-8183 delivery.
+
+    The write path had it too (mint/swap/decrease/collect), where the failure
+    mode is building a transaction against the wrong chain entirely.
+    """
+    import inspect
+
+    import blockchain as chain
+    import lp_signing as lp
+
+    offenders = []
+    for mod in (chain, lp):
+        for name, fn in vars(mod).items():
+            if not (inspect.isfunction(fn) and fn.__module__ == mod.__name__):
+                continue
+            params = inspect.signature(fn).parameters
+            p = params.get("network")
+            if p is not None and isinstance(p.default, str) and p.default:
+                offenders.append(f"{mod.__name__}.{name} defaults to {p.default!r}")
+    assert not offenders, (
+        "network defaults must be None and resolve via default_network(): "
+        + "; ".join(offenders)
+    )
+
+
 def test_protocol_unavailable_is_its_own_error_class():
     """Spec 15 "protocol unavailable" must be distinguishable.
 

@@ -280,7 +280,7 @@ def snap_tick(tick: int, spacing: int, *, up: bool) -> int:
 
 
 def price_range_to_ticks(
-    lower_price: float, upper_price: float, network: str = "bsc-testnet"
+    lower_price: float, upper_price: float, network: str | None = None
 ) -> dict[str, Any]:
     """Convert a BNB price range to the pool's snapped ``(tickLower, tickUpper)``.
 
@@ -289,6 +289,7 @@ def price_range_to_ticks(
     inverted range that mint rejects (or, worse, silently accepts as a range
     that never contains the price).
     """
+    network = network or default_network()
     if not (upper_price > lower_price):
         raise ValueError(f"upper_price must exceed lower_price ({upper_price} <= {lower_price})")
     cfg = _cfg(network)
@@ -332,13 +333,14 @@ def _price_bounds_from_ticks(
 
 # --- Read-only chain queries (LLM-visible) -------------------------------------
 @_retry_rpc
-def get_bnb_price(network: str = "bsc-testnet") -> dict[str, Any]:
+def get_bnb_price(network: str | None = None) -> dict[str, Any]:
     """Current BNB price in USDT from the PancakeSwap V3 BNB/USDT pool.
 
     Reads the pool's live ``slot0`` tick. Note: on BSC testnet this pool is not
     arbitraged against real markets, so the value will not track the real BNB
     price.
     """
+    network = network or default_network()
     cfg = _cfg(network)
     pool = _pool(network)
     slot0 = pool.functions.slot0().call()
@@ -357,12 +359,13 @@ def get_bnb_price(network: str = "bsc-testnet") -> dict[str, Any]:
 
 
 @_retry_rpc
-def get_lp_position(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_lp_position(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Full PancakeSwap V3 LP position for an NFT ``token_id``.
 
     Returns the raw position record (tokens, fee tier, tick bounds, liquidity)
     plus the tick bounds converted to BNB price bounds and the owner address.
     """
+    network = network or default_network()
     npm = _npm(network)
     p = npm.functions.positions(int(token_id)).call()
     (_nonce, operator, token0, token1, fee, tick_lower, tick_upper, liquidity,
@@ -405,7 +408,7 @@ def get_lp_position(token_id: int, network: str = "bsc-testnet") -> dict[str, An
     }
 
 
-def get_lp_current_range(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_lp_current_range(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Where the live price sits inside an LP position's range.
 
     Combines the position's tick bounds with the pool's current tick and
@@ -413,6 +416,7 @@ def get_lp_current_range(token_id: int, network: str = "bsc-testnet") -> dict[st
     at the upper), whether the price is still in range, and how far it sits
     from the nearest bound.
     """
+    network = network or default_network()
     pos = get_lp_position(token_id, network)
     price = get_bnb_price(network)
     lower, upper = pos["lower_price_usdt_per_bnb"], pos["upper_price_usdt_per_bnb"]
@@ -434,8 +438,9 @@ def get_lp_current_range(token_id: int, network: str = "bsc-testnet") -> dict[st
 
 
 @_retry_rpc
-def get_lp_liquidity(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_lp_liquidity(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Liquidity of an LP position, alongside the pool's total active liquidity."""
+    network = network or default_network()
     pos = get_lp_position(token_id, network)
     pool_liq = int(_pool(network).functions.liquidity().call())
     liq = pos["liquidity"]
@@ -450,7 +455,7 @@ def get_lp_liquidity(token_id: int, network: str = "bsc-testnet") -> dict[str, A
 
 
 @_retry_rpc
-def get_pending_fees(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_pending_fees(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Uncollected trading fees for an LP position, in both tokens.
 
     Uses an ``eth_call`` against ``collect`` from the position's owner — a
@@ -458,6 +463,7 @@ def get_pending_fees(token_id: int, network: str = "bsc-testnet") -> dict[str, A
     ``tokensOwed``, which only counts fees already checkpointed by a prior
     interaction and reads 0 for a position that has simply been accruing.
     """
+    network = network or default_network()
     cfg = _cfg(network)
     npm = _npm(network)
     pos = get_lp_position(token_id, network)
@@ -516,14 +522,31 @@ DEFAULT_TRIGGER_PCT = 5.0
 
 @lru_cache(maxsize=1)
 def default_network() -> str:
-    """``[network].default`` from studio.toml.
+    """The active network: ``$BNB_NETWORK`` if set, else ``[network].default``.
 
-    Everything network-scoped routes through here so switching mainnet/testnet
-    is a config edit, not a code edit. Note that ``[strategy].token_id`` is
-    network-specific: an ID minted on testnet names a DIFFERENT (or missing)
-    position on mainnet. The ``is_managed_pair`` guard catches the mismatch
-    rather than trading against a stranger's position.
+    Everything network-scoped routes through here, so switching chains is one
+    env var rather than a code change — and, with ``[strategy].token_ids``
+    below, no config edit either.
+
+    The env override exists because switching by hand meant editing three
+    coupled lines (``[network].default``, ``[strategy].token_id``,
+    ``[payments.erc8183].currency``); getting one wrong is B7, and their
+    comments drifted out of date twice while testing.
+
+    One thing the override CANNOT move: ``[payments.erc8183].currency`` is read
+    from studio.toml by the SDK, not by this module, so a network set purely by
+    env still signs quotes in whatever token that line names.
+    ``check_config_consistency()`` fails loudly when the two disagree rather
+    than letting the agent sign a worthless quote.
     """
+    override = os.environ.get("BNB_NETWORK")
+    if override:
+        if override not in supported_networks():
+            raise ValueError(
+                f"$BNB_NETWORK={override!r} is not a supported network "
+                f"({', '.join(supported_networks())})"
+            )
+        return override
     try:
         name = str((_studio_toml().get("network") or {}).get("default") or "")
         if name in supported_networks():
@@ -565,17 +588,31 @@ def check_config_consistency(network: str | None = None) -> list[str]:
     return _impl(network)
 
 
-def managed_token_id() -> int:
-    """The LP NFT this agent manages (``[strategy].token_id``).
+def managed_token_id(network: str | None = None) -> int:
+    """The LP NFT this agent manages, for the ACTIVE network.
+
+    Token IDs are per-network: an ID minted on testnet names a different (or
+    missing) position on mainnet. ``[strategy].token_ids`` holds one per
+    network so switching chains needs no edit::
+
+        [strategy.token_ids]
+        bsc-mainnet = 7116214
+        bsc-testnet = 36799
+
+    Falls back to the flat ``[strategy].token_id`` when the table is absent, so
+    existing configs keep working.
 
     Raises when unset — acting on token_id 0 would silently read someone
     else's position.
     """
-    token_id = int(strategy_config().get("token_id") or 0)
+    network = network or default_network()
+    cfg = strategy_config()
+    per_network = cfg.get("token_ids") or {}
+    token_id = int(per_network.get(network) or cfg.get("token_id") or 0)
     if token_id <= 0:
         raise ValueError(
-            "no managed LP position: set [strategy].token_id in studio.toml "
-            "after minting one (see `python mint_position.py`)"
+            f"no managed LP position for {network}: set [strategy.token_ids].{network} "
+            "in studio.toml after minting one (see `python mint_position.py`)"
         )
     return token_id
 
@@ -720,8 +757,9 @@ def amounts_to_liquidity(
 
 
 @_retry_rpc
-def get_position_value(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_position_value(token_id: int, network: str | None = None) -> dict[str, Any]:
     """Token amounts and USDT value (TVL) held by a position — spec 4.6 ``tvl``."""
+    network = network or default_network()
     cfg = _cfg(network)
     pos = get_lp_position(token_id, network)
     slot0 = _pool(network).functions.slot0().call()
@@ -748,9 +786,10 @@ def get_position_value(token_id: int, network: str = "bsc-testnet") -> dict[str,
     }
 
 
-def get_position_summary(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
+def get_position_summary(token_id: int, network: str | None = None) -> dict[str, Any]:
     """One-call status of the managed LP position: price, range, liquidity,
     pending fees, and whether a rebalance is currently required."""
+    network = network or default_network()
     rng = get_lp_current_range(token_id, network)
     decision = calculate_rebalance_required(
         rng["current_price_usdt_per_bnb"],
@@ -779,7 +818,7 @@ def get_position_summary(token_id: int, network: str = "bsc-testnet") -> dict[st
 
 @_retry_rpc
 def verify_position(token_id: int, tx_hash: str | None = None,
-                    network: str = "bsc-testnet") -> dict[str, Any]:
+                    network: str | None = None) -> dict[str, Any]:
     """Confirm a position is real, owned, funded, and in range (spec 4.5).
 
     The last step of the 4.4 workflow ("Verify new position") and the last
@@ -796,6 +835,7 @@ def verify_position(token_id: int, tx_hash: str | None = None,
     Returns ``verified`` plus the individual checks, so a caller that fails can
     see WHICH check failed rather than just that something did.
     """
+    network = network or default_network()
     from bnbagent_studio_core.wallet import get_wallet
 
     checks: dict[str, Any] = {}

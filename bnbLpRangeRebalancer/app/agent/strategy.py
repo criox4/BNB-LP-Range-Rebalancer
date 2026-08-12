@@ -22,17 +22,38 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from web3 import Web3
 
 import lp_signing as lp
-import pancake as pcs
+import blockchain as pcs
+import risk
 
 log = logging.getLogger("seller-agent.strategy")
 
 NETWORK = pcs.default_network()
+
+
+@lru_cache(maxsize=1)
+def agent_id() -> str:
+    """Stable identifier for this agent in logs (spec 14 ``agent_id``).
+
+    The wallet address is the real on-chain identity and is the same value the
+    ERC-8004 registration resolves to, so log lines join to chain activity
+    without a lookup table. Falls back to the project name when no wallet is
+    unlocked (local reads, CI).
+    """
+    try:
+        from bnbagent_studio_core.wallet import get_wallet
+
+        return str(get_wallet().address)
+    except Exception:  # noqa: BLE001 — a log label must never break the agent
+        return "bnbLpRangeRebalancer"
+
+
 # Per-network state: a testnet run must never be read as mainnet history
 # (different chain, different token_id, different money).
 STATE_PATH = Path(__file__).parent / f".lp_state.{NETWORK}.json"
@@ -435,8 +456,16 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
     owner = Web3.to_checksum_address(get_wallet().address)
     cfg = pcs._cfg(NETWORK)
     pos = pcs.get_lp_position(token_id, NETWORK)
-    if pos["owner"] != owner:
-        raise PermissionError(f"position {token_id} is owned by {pos['owner']}, not this agent")
+    risk.require_position_owner(pos, owner)
+    risk.require_managed_position(pos, "rebalance")
+
+    # Spec 14 log fields: what went IN to the rebalance, in token terms.
+    input_amount = {
+        "usdt": pos["tokens_owed0"] / 10 ** pcs._decimals(NETWORK, cfg["usdt"]),
+        "bnb": pos["tokens_owed1"] / 10 ** pcs._decimals(NETWORK, cfg["wbnb"]),
+        "liquidity_raw": pos["liquidity"],
+        "tvl_usdt": pcs.get_position_value(token_id, NETWORK).get("tvl_usdt", 0.0),
+    }
 
     txs: list[str] = []
     gas = 0  # wei actually spent on gas, not gas units
@@ -489,16 +518,34 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
     if new_id is None:
         raise RuntimeError(f"mint succeeded but token_id unreadable; txs={txs}")
 
-    # 6. Verify the replacement really is in range before calling it done.
+    # 6. Verify the replacement — spec 4.4's "Verify new position" and 4.8's
+    # "New LP position is verified". Re-reads chain state rather than trusting
+    # the mint's return values: a mint can succeed and still leave a position
+    # that is empty or already out of range.
+    check_result = pcs.verify_position(new_id, minted["tx_hash"], NETWORK)
     verified = pcs.get_position_summary(new_id, NETWORK)
-    if not verified["in_range"]:
-        log.warning("new position %s is NOT in range: %s", new_id, verified)
+    if not check_result["verified"]:
+        log.error("new position %s FAILED verification: %s",
+                  new_id, check_result["problems"])
 
     state = load_state()
+    # Spec 14 log fields: agent_id, input_amount, output_amount, error.
     entry = {"at": _now(), "from_token_id": token_id, "to_token_id": new_id,
              "reason": summary["rebalance_reason"], "price": price,
              "lower": verified["lower_price"], "upper": verified["upper_price"],
-             "txs": txs}
+             "txs": txs,
+             "agent_id": agent_id(),
+             "action": "rebalance",
+             "input_amount": input_amount,
+             "output_amount": {
+                 "liquidity_raw": check_result["liquidity"],
+                 "tvl_usdt": check_result["tvl_usdt"],
+                 "lower_price": check_result["lower_price"],
+                 "upper_price": check_result["upper_price"],
+             },
+             "gas_cost_wei": gas,
+             "verified": check_result["verified"],
+             "error": "; ".join(check_result["problems"]) or None}
     _update(
         token_id=new_id,
         rebalance_count=state["rebalance_count"] + 1,
@@ -513,7 +560,7 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
     return {"rebalanced": True, "old_token_id": token_id, "new_token_id": new_id,
             "reason": summary["rebalance_reason"], "txs": txs, "gas_cost_wei": gas,
             "new_range": [verified["lower_price"], verified["upper_price"]],
-            "in_range": verified["in_range"]}
+            "in_range": verified["in_range"], "verification": check_result}
 
 
 def _persist_token_id(token_id: int, path: Path | None = None) -> None:
@@ -593,6 +640,17 @@ def start_monitor() -> None:
 
 def stop_monitor() -> None:
     _stop.set()
+
+
+def is_monitor_running() -> bool:
+    """Whether THIS process is running the loop.
+
+    Per-process, not global: the agent and the service are separate processes
+    sharing a state file, so a False here means "not in this process", not
+    "nobody is monitoring". /health reports it alongside the strategy status
+    for exactly that reason.
+    """
+    return bool(_thread and _thread.is_alive())
 
 
 ACTIONS = {

@@ -30,7 +30,7 @@ from google.adk.tools import FunctionTool
 
 from bnbagent_studio_core.tools import chain_readonly as cr
 
-import pancake as pcs
+import blockchain as pcs
 
 # PancakeSwap V3 reads for the managed BNB/USDT LP position. All are eth_calls
 # (`collect` is only ever simulated, never sent). The rebalance write path —
@@ -44,6 +44,7 @@ LP_READ_TOOLS = [
     FunctionTool(pcs.get_lp_liquidity),
     FunctionTool(pcs.get_pending_fees),
     FunctionTool(pcs.get_position_summary),
+    FunctionTool(pcs.verify_position),   # spec 4.5 / 4.8 — read-only re-check
     # Pure math — no chain access, safe for the LLM to explore hypotheticals with.
     FunctionTool(pcs.calculate_range_metrics),
     FunctionTool(pcs.calculate_rebalance_required),

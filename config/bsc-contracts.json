@@ -1,0 +1,73 @@
+{
+  "_readme": [
+    "Shared BSC contract address book for the BNB Agent Studio Marketplace agents.",
+    "Spec section 13: 'Do NOT allow individual developers to independently hardcode or",
+    "invent protocol addresses.' This file is the single source of truth; agents",
+    "load it, they do not embed their own copies.",
+    "",
+    "EVERY address here was verified by calling it on the live chain, not copied",
+    "from documentation. Two traps this file encodes, both confirmed by calling:",
+    "  * docs.pancakeswap.finance lists a 'Factory V3' (0x1296b67b...) and",
+    "    'Router V3' (0xEfF92A26...) that have NO CODE on BSC mainnet.",
+    "  * quoter_v2 is effectively SWAPPED between the networks: both contracts",
+    "    exist on both chains, but 0xbC203d7f only answers on testnet and",
+    "    0xB048Bbc1 only on mainnet. The wrong one reverts with a bare",
+    "    'execution reverted: 0x'.",
+    "Also note position_manager DIFFERS per network even though factory is",
+    "IDENTICAL on both. Re-verify with `python test_blockchain.py --live`, which",
+    "checks every address on both chains."
+  ],
+  "verified_at": "2026-08-11",
+  "verified_by": "test_blockchain.py::_live_addressbook",
+  "networks": {
+    "bsc-mainnet": {
+      "chain_id": 56,
+      "tokens": {
+        "wbnb": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+        "usdt": "0x55d398326f99059fF775485246999027B3197955"
+      },
+      "pancakeswap_v3": {
+        "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        "position_manager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+        "quoter_v2": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+        "swap_router": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+        "pools": {
+          "BNB/USDT": [
+            {
+              "fee": 500,
+              "address": "0x36696169C63e42cd08ce11f5deeBbCeBae652050",
+              "note": "chosen for parity with testnet"
+            },
+            {
+              "fee": 100,
+              "address": "0x172fcD41E0913e95784454622d1c3724f546f849",
+              "note": "~2x deeper but earns a fifth the fee rate — pick deliberately"
+            }
+          ]
+        }
+      }
+    },
+    "bsc-testnet": {
+      "chain_id": 97,
+      "tokens": {
+        "wbnb": "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd",
+        "usdt": "0x337610d27c682E347C9cD60BD4b3b107C9d34dDd"
+      },
+      "pancakeswap_v3": {
+        "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        "position_manager": "0x427bF5b37357632377eCbEC9de3626C71A5396c1",
+        "quoter_v2": "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2",
+        "swap_router": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+        "pools": {
+          "BNB/USDT": [
+            {
+              "fee": 500,
+              "address": "0x2dbB5a4c235164B9f772179A43faca2c71a8abDB",
+              "note": "deepest testnet BNB/USDT pool; unarbitraged, reads ~12-16 USDT/BNB"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

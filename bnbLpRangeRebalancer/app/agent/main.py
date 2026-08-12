@@ -238,7 +238,7 @@ agent_card = build_agent_card()
 # this module never starts moving funds on its own. The decision and the
 # calldata are both fixed code — see strategy.py / lp_signing.py.
 try:
-    from pancake import check_config_consistency
+    from blockchain import check_config_consistency
     from strategy import start_monitor
 
     # Loud at boot: cross-field config errors (wrong-chain currency, a token_id

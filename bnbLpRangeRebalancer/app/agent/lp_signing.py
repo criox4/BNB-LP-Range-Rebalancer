@@ -6,21 +6,23 @@ FIXED entrypoint code. Neither appears in ``tools.py``, so the LLM can never
 call them — it decides *whether* to rebalance, deterministic code decides *what
 calldata that means*. That is spec section 3's whole requirement.
 
-## Why this file carries its own guards
+## Where the guards live
 
 The SDK's ``SigningPolicy`` gates ``sign_typed_data`` (EIP-712) only —
 ``sign_transaction`` is NOT policy-checked. Every call here is a plain
-transaction, so the policy will not stop a bad one. The guards below are
-therefore the real boundary, not a belt-and-braces extra:
+transaction, so the policy will not stop a bad one. ``risk.py`` is therefore the
+real boundary, and this module calls into it before every send:
 
-* ``_require_allowed`` — refuses to build a transaction to any address outside
-  the verified table in ``pancake.ADDRESSES`` for the active network.
-* Approvals are EXACT-amount and reset to 0 afterwards on failure paths — never
-  unlimited. (An unlimited approve to a router is the classic way an agent
-  wallet gets drained later.)
-* Every swap carries an ``amountOutMinimum`` derived from a live quote, and
-  every call carries a deadline.
-* Gas price and gas limit are bounded.
+* ``risk.require_allowed_address`` — no transaction is built to any address
+  outside the shared address book.
+* ``risk.require_gas_price`` — bounded gas price; gas limits are fixed here.
+* ``risk.min_out_from_quote`` / ``risk.liquidity_amount_floors`` — every
+  value-moving leg carries a floor derived from live chain state.
+* ``risk.require_managed_position`` — no NFT but this agent's is ever modified.
+
+Approvals are EXACT-amount, never unlimited (an unlimited approve to a router is
+the classic way an agent wallet gets drained later), and every call carries a
+deadline.
 
 None of these read LLM output. All inputs are numbers this module computed or
 that came from studio.toml.
@@ -35,12 +37,12 @@ from web3 import Web3
 
 from bnbagent_studio_core.wallet import get_wallet
 
-import pancake as pcs
+import blockchain as pcs
+import risk
 
 log = logging.getLogger("seller-agent.lp")
 
 DEADLINE_SECONDS = 600
-MAX_GAS_PRICE_GWEI = 20  # BSC testnet sits ~1-3 gwei; refuse anything wild.
 DEFAULT_GAS_LIMIT = 900_000
 
 WBNB_ABI = [
@@ -89,6 +91,15 @@ NPM_WRITE_ABI = [
          {"type": "address", "name": "recipient"}, {"type": "uint256", "name": "deadline"}]}],
      "outputs": [{"type": "uint256", "name": "tokenId"}, {"type": "uint128", "name": "liquidity"},
                  {"type": "uint256", "name": "amount0"}, {"type": "uint256", "name": "amount1"}]},
+    {"name": "increaseLiquidity", "type": "function", "stateMutability": "payable",
+     "inputs": [{"type": "tuple", "name": "params", "components": [
+         {"type": "uint256", "name": "tokenId"},
+         {"type": "uint256", "name": "amount0Desired"},
+         {"type": "uint256", "name": "amount1Desired"},
+         {"type": "uint256", "name": "amount0Min"}, {"type": "uint256", "name": "amount1Min"},
+         {"type": "uint256", "name": "deadline"}]}],
+     "outputs": [{"type": "uint128", "name": "liquidity"},
+                 {"type": "uint256", "name": "amount0"}, {"type": "uint256", "name": "amount1"}]},
     {"name": "decreaseLiquidity", "type": "function", "stateMutability": "payable",
      "inputs": [{"type": "tuple", "name": "params", "components": [
          {"type": "uint256", "name": "tokenId"}, {"type": "uint128", "name": "liquidity"},
@@ -106,23 +117,9 @@ ERC20_WRITE_ABI = WBNB_ABI  # approve/allowance/balanceOf are the shared subset
 
 
 # --- Guards --------------------------------------------------------------------
-def _require_allowed(network: str, address: str) -> str:
-    """Refuse to transact with anything outside the verified address table.
-
-    ``sign_transaction`` bypasses SigningPolicy, so this is the only thing
-    standing between a wrong/injected address and a signed transaction.
-    """
-    cfg = pcs._cfg(network)
-    allowed = {
-        str(cfg[k]).lower()
-        for k in ("factory", "position_manager", "quoter_v2", "swap_router", "wbnb", "usdt", "pool")
-    }
-    if address.lower() not in allowed:
-        raise PermissionError(
-            f"refusing to transact with {address} on {network}: not in the verified "
-            f"PancakeSwap address table (pancake.ADDRESSES)"
-        )
-    return Web3.to_checksum_address(address)
+# Thin alias so call sites read the same as before; the check itself lives in
+# risk.py (spec 2's Risk Engine), which is the only place it may be changed.
+_require_allowed = risk.require_allowed_address
 
 
 def _deadline() -> int:
@@ -136,12 +133,7 @@ def _send(network: str, fn, *, value: int = 0, gas: int = DEFAULT_GAS_LIMIT) -> 
     wallet = get_wallet()
     sender = Web3.to_checksum_address(wallet.address)
 
-    gas_price = w3.eth.gas_price
-    if gas_price > Web3.to_wei(MAX_GAS_PRICE_GWEI, "gwei"):
-        raise RuntimeError(
-            f"gas price {Web3.from_wei(gas_price, 'gwei')} gwei exceeds the "
-            f"{MAX_GAS_PRICE_GWEI} gwei ceiling — refusing to send"
-        )
+    gas_price = risk.require_gas_price(w3)
 
     tx = fn.build_transaction({
         "from": sender,
@@ -237,12 +229,10 @@ def execute_swap(token_in: str, token_out: str, amount_in_wei: int,
     """
     cfg = pcs._cfg(network)
     if max_slippage_pct is None:
-        max_slippage_pct = float(pcs.strategy_config()["max_slippage_pct"])
+        max_slippage_pct = risk.slippage_pct("swap")
 
     quoted = quote_swap(token_in, token_out, amount_in_wei, network)
-    if quoted <= 0:
-        raise RuntimeError("quoter returned zero output — no liquidity for this size")
-    min_out = int(quoted * (1 - max_slippage_pct / 100.0))
+    min_out = risk.min_out_from_quote(quoted, max_slippage_pct)
 
     approve_exact(token_in, cfg["swap_router"], amount_in_wei, network)
     router = _contract(network, cfg["swap_router"], ROUTER_ABI)
@@ -266,7 +256,7 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
 
     ``lower_price``/``upper_price`` are USDT per BNB; the tick conversion (and
     its inversion, since token0 is USDT) happens in
-    :func:`pancake.price_range_to_ticks`.
+    :func:`blockchain.price_range_to_ticks`.
 
     When ``amount0_min``/``amount1_min`` are None they are DERIVED: predict the
     deposit the contract will actually take (the same liquidity math it uses
@@ -280,21 +270,18 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
     recipient = Web3.to_checksum_address(get_wallet().address)
 
     if amount0_min is None or amount1_min is None:
-        slip = float(pcs.strategy_config().get("mint_slippage_pct", 1.0)) / 100.0
+        slip = risk.slippage_pct("mint")
         sqrt_price_x96 = int(pcs._pool(network).functions.slot0().call()[0])
         liq = pcs.amounts_to_liquidity(
             amount_usdt_wei, amount_wbnb_wei, sqrt_price_x96,
             ticks["tick_lower"], ticks["tick_upper"],
         )
-        exp0, exp1 = pcs.liquidity_to_amounts(
-            liq, sqrt_price_x96, ticks["tick_lower"], ticks["tick_upper"]
+        floor0, floor1 = risk.liquidity_amount_floors(
+            liq, sqrt_price_x96, ticks["tick_lower"], ticks["tick_upper"], slip
         )
-        if amount0_min is None:
-            amount0_min = int(exp0 * (1 - slip))
-        if amount1_min is None:
-            amount1_min = int(exp1 * (1 - slip))
-        log.info("mint mins: expected (%s, %s) -> floor (%s, %s) at %.2f%%",
-                 exp0, exp1, amount0_min, amount1_min, slip * 100)
+        amount0_min = floor0 if amount0_min is None else amount0_min
+        amount1_min = floor1 if amount1_min is None else amount1_min
+        log.info("mint mins: floor (%s, %s) at %.2f%%", amount0_min, amount1_min, slip)
 
     if amount_usdt_wei > 0:
         approve_exact(cfg["usdt"], cfg["position_manager"], amount_usdt_wei, network)
@@ -325,6 +312,53 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
     return result
 
 
+def increase_liquidity(token_id: int, amount_usdt_wei: int, amount_wbnb_wei: int,
+                       amount0_min: int | None = None, amount1_min: int | None = None,
+                       network: str = "bsc-testnet") -> dict[str, Any]:
+    """Add liquidity to the EXISTING position, keeping its range and its NFT.
+
+    Spec 4.1 lists ``increaseLiquidity()`` among the required LP operations. The
+    rebalance flow does not use it — a rebalance changes the range, which means
+    a new position — but topping up an in-range position is the cheaper path
+    when the range is still good: no burn, no re-mint, no new token_id, and the
+    accrued fees stay put.
+
+    Mins are derived exactly as in :func:`mint_position`.
+    """
+    if amount_usdt_wei <= 0 and amount_wbnb_wei <= 0:
+        raise ValueError("nothing to add: both amounts are zero")
+    cfg = pcs._cfg(network)
+    pos = pcs.get_lp_position(token_id, network)
+    risk.require_managed_position(pos, "increase")
+
+    if amount0_min is None or amount1_min is None:
+        slip = risk.slippage_pct("mint")
+        sqrt_price_x96 = int(pcs._pool(network).functions.slot0().call()[0])
+        liq = pcs.amounts_to_liquidity(
+            amount_usdt_wei, amount_wbnb_wei, sqrt_price_x96,
+            pos["tick_lower"], pos["tick_upper"],
+        )
+        floor0, floor1 = risk.liquidity_amount_floors(
+            liq, sqrt_price_x96, pos["tick_lower"], pos["tick_upper"], slip
+        )
+        amount0_min = floor0 if amount0_min is None else amount0_min
+        amount1_min = floor1 if amount1_min is None else amount1_min
+        log.info("increase mins: floor (%s, %s) at %.2f%%", amount0_min, amount1_min, slip)
+
+    if amount_usdt_wei > 0:
+        approve_exact(cfg["usdt"], cfg["position_manager"], amount_usdt_wei, network)
+    if amount_wbnb_wei > 0:
+        approve_exact(cfg["wbnb"], cfg["position_manager"], amount_wbnb_wei, network)
+
+    npm = _contract(network, cfg["position_manager"], NPM_WRITE_ABI)
+    result = _send(network, npm.functions.increaseLiquidity((
+        int(token_id), int(amount_usdt_wei), int(amount_wbnb_wei),
+        int(amount0_min), int(amount1_min), _deadline(),
+    )), gas=500_000)
+    result["token_id"] = int(token_id)
+    return result
+
+
 def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = None,
                        amount1_min: int | None = None,
                        network: str = "bsc-testnet") -> dict[str, Any]:
@@ -342,25 +376,19 @@ def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = 
     if liquidity <= 0:
         raise ValueError("liquidity must be positive")
     pos = pcs.get_lp_position(token_id, network)
-    if not pos["is_managed_pair"]:
-        raise PermissionError(
-            f"token_id {token_id} is not the managed BNB/USDT position — refusing to modify"
-        )
+    risk.require_managed_position(pos, "modify")
     if liquidity > pos["liquidity"]:
         raise ValueError(f"position has {pos['liquidity']} liquidity, asked to remove {liquidity}")
 
     if amount0_min is None or amount1_min is None:
-        slip = float(pcs.strategy_config()["max_slippage_pct"]) / 100.0
+        slip = risk.slippage_pct("swap")
         sqrt_price_x96 = int(pcs._pool(network).functions.slot0().call()[0])
-        exp0, exp1 = pcs.liquidity_to_amounts(
-            liquidity, sqrt_price_x96, pos["tick_lower"], pos["tick_upper"]
+        floor0, floor1 = risk.liquidity_amount_floors(
+            liquidity, sqrt_price_x96, pos["tick_lower"], pos["tick_upper"], slip
         )
-        if amount0_min is None:
-            amount0_min = int(exp0 * (1 - slip))
-        if amount1_min is None:
-            amount1_min = int(exp1 * (1 - slip))
-        log.info("decrease mins: expected (%s, %s) -> floor (%s, %s) at %.2f%%",
-                 exp0, exp1, amount0_min, amount1_min, slip * 100)
+        amount0_min = floor0 if amount0_min is None else amount0_min
+        amount1_min = floor1 if amount1_min is None else amount1_min
+        log.info("decrease mins: floor (%s, %s) at %.2f%%", amount0_min, amount1_min, slip)
 
     npm = _contract(network, pcs._cfg(network)["position_manager"], NPM_WRITE_ABI)
     return _send(network, npm.functions.decreaseLiquidity(
@@ -372,10 +400,7 @@ def collect_fees(token_id: int, network: str = "bsc-testnet") -> dict[str, Any]:
     """Sweep all owed tokens (accrued fees + anything freed by
     ``decrease_liquidity``) from the position to the wallet."""
     pos = pcs.get_lp_position(token_id, network)
-    if not pos["is_managed_pair"]:
-        raise PermissionError(
-            f"token_id {token_id} is not the managed BNB/USDT position — refusing to collect"
-        )
+    risk.require_managed_position(pos, "collect")
     npm = _contract(network, pcs._cfg(network)["position_manager"], NPM_WRITE_ABI)
     recipient = Web3.to_checksum_address(get_wallet().address)
     return _send(network, npm.functions.collect(

@@ -1,17 +1,17 @@
-"""Self-check for the pure range math in pancake.py.
+"""Self-check for the pure range math in blockchain.py.
 
 The numbers come straight from the spec's section 4.3 worked example, so if the
 trigger rule ever drifts from what the spec asks for, this fails. Chain reads
-are not covered here (they need a live RPC) — run `python -m test_pancake --live`
+are not covered here (they need a live RPC) — run `python -m test_blockchain --live`
 for a read-only smoke test against BSC testnet.
 
-    python test_pancake.py
+    python test_blockchain.py
 """
 from __future__ import annotations
 
 import sys
 
-from pancake import (
+from blockchain import (
     _bnb_price_from_tick,
     _price_bounds_from_ticks,
     _tick_from_bnb_price,
@@ -143,7 +143,7 @@ def test_price_range_maps_to_inverted_ticks():
 
 def test_liquidity_amounts_roundtrip():
     """amounts -> liquidity -> amounts must return what the contract would take."""
-    from pancake import amounts_to_liquidity, liquidity_to_amounts
+    from blockchain import amounts_to_liquidity, liquidity_to_amounts
 
     # Spot inside the range: both tokens used.
     tick, lower, upper = -64154, -65090, -63070
@@ -160,7 +160,7 @@ def test_liquidity_amounts_roundtrip():
 def test_liquidity_amounts_out_of_range_is_single_sided():
     """Below the range it is all token0; above, all token1. This is what makes a
     flat percentage-of-desired mint floor wrong."""
-    from pancake import liquidity_to_amounts
+    from blockchain import liquidity_to_amounts
 
     lower, upper, liq = -65090, -63070, 10**18
     below = int((1.0001 ** (-66000 / 2)) * 2**96)
@@ -172,7 +172,7 @@ def test_liquidity_amounts_out_of_range_is_single_sided():
 
 
 def test_zero_liquidity_has_no_amounts():
-    from pancake import liquidity_to_amounts
+    from blockchain import liquidity_to_amounts
 
     assert liquidity_to_amounts(0, 2**96, -100, 100) == (0, 0)
 
@@ -205,7 +205,7 @@ def test_fees_since_window_incompleteness_is_reported():
 
 def _live_smoke():
     """Read-only smoke test against BSC testnet. Needs network."""
-    from pancake import get_bnb_price, get_lp_position, get_pending_fees
+    from blockchain import get_bnb_price, get_lp_position, get_pending_fees
 
     price = get_bnb_price("bsc-testnet")
     print("live pool read:", price)
@@ -235,7 +235,7 @@ def _live_addressbook():
     """
     from web3 import Web3
 
-    from pancake import ADDRESSES, _cfg, _w3
+    from blockchain import _cfg, _w3, supported_networks
 
     factory_abi = [{"name": "getPool", "type": "function", "stateMutability": "view",
                     "inputs": [{"type": "address"}, {"type": "address"}, {"type": "uint24"}],
@@ -248,7 +248,7 @@ def _live_addressbook():
                    "outputs": [{"type": "uint256"}, {"type": "uint160"},
                                {"type": "uint32"}, {"type": "uint256"}]}]
 
-    for network in ADDRESSES:
+    for network in supported_networks():
         cfg = _cfg(network)
         w3 = _w3(network)
         ck = Web3.to_checksum_address
@@ -284,7 +284,7 @@ def _live_guards():
     refuses one, and that it does so BEFORE any signing could happen.
     """
     import lp_signing as lp
-    from pancake import get_bnb_price, price_range_to_ticks
+    from blockchain import get_bnb_price, price_range_to_ticks
 
     attacker = "0x000000000000000000000000000000000000dEaD"
     for label, call in {
@@ -317,7 +317,7 @@ def _live_config_consistency():
     a mainnet quote payable in the testnet token."""
     from bnbagent.networks import BNB_CHAIN_ADDRESSES
 
-    from pancake import check_config_consistency, default_network
+    from blockchain import check_config_consistency, default_network
 
     problems = check_config_consistency()
     for p in problems:
@@ -330,7 +330,7 @@ def _live_config_consistency():
           f"{BNB_CHAIN_ADDRESSES[chain_id].payment_token}")
 
     # Prove the guard actually fires rather than always returning clean.
-    import pancake as pcs
+    import blockchain as pcs
 
     other = 97 if chain_id == 56 else 56
     wrong = BNB_CHAIN_ADDRESSES[other].payment_token

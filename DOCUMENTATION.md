@@ -4,7 +4,7 @@ Living record of what was built, why each decision was made the way it was, what
 is verified on-chain, and what remains. Spec reference throughout is
 `BNB Agent Studio Marketplace.md` (v1.0), cited as **§n**.
 
-**Last updated:** 2026-08-11
+**Last updated:** 2026-08-12
 **Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
 **Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`
 
@@ -20,7 +20,8 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
 | Monitor loop | runs inside the A2A runtime, 60s poll |
 | Runtime state | **paused** (will not trade unattended) |
-| Tests | 14 unit + live address-book / guard / config checks |
+| Service Layer | `app/service` — all 10 §8 routes live on :8080 |
+| Tests | 29 offline (14 math + 9 strategy + 6 service) + live address-book / guard / config checks |
 | Blocked on credentials | AWS deploy, IPFS storage |
 | Blocked on a clean wallet | ERC-8004 identity |
 
@@ -40,7 +41,7 @@ requires all four agents.
 
 | Req | Requirement | Status | Where |
 |---|---|---|---|
-| §4.1 | PancakeSwap V3: Pool, Factory, NonfungiblePositionManager, QuoterV2, SwapRouter | **done** | `pancake.ADDRESSES`, `lp_signing.py` |
+| §4.1 | PancakeSwap V3: Pool, Factory, NPM, QuoterV2, SwapRouter; positions/mint/increaseLiquidity/decreaseLiquidity/collect | **done** | `config/bsc-contracts.json`, `lp_signing.py` |
 | §4.2 | BNB/USDT only, v1 | **done** | single pool in config |
 | §4.3 | ±10% range, 5% trigger, configurable | **done** | `[strategy]` in `studio.toml` |
 | §4.4 | Monitor → detect → decrease → collect → swap → mint → verify | **done** | `strategy.rebalance()` |
@@ -65,25 +66,25 @@ requires all four agents.
 | `decrease_liquidity()` | `lp_signing.decrease_liquidity` | |
 | `collect_fees()` | `lp_signing.collect_fees` | |
 | `mint_position()` | `lp_signing.mint_position` | derived mins |
-| `verify_position()` | `pancake.get_position_summary` | called post-mint in `rebalance()` |
+| `verify_position()` | `blockchain.verify_position` | named tool; re-reads chain state, checks exists/pair/owner/liquidity/in-range/receipt |
 
 ### 2.3 Cross-cutting requirements (§3, §8–§17)
 
 | Req | Requirement | Status | Notes |
 |---|---|---|---|
 | §3.1 | LLM must never generate arbitrary calldata | **done** | §4.1 below; enforced + tested |
-| §8 | REST: `/health` `/status` `/strategy` `/performance` `/positions` `/transactions`, `POST /activate` `/pause` `/execute` | **NOT DONE** | we serve A2A JSON-RPC + `/ping`. See gap G1 |
-| §9 | Shared agent metadata JSON | **NOT DONE** | see gap G2 |
+| §8 | REST: `/health` `/status` `/strategy` `/performance` `/positions` `/transactions`, `POST /activate` `/pause` `/execute` | **done** | `app/service/api.py`; control routes gated by `$SERVICE_API_KEY`, fail closed |
+| §9 | Shared agent metadata JSON | **done** | `GET /metadata` |
 | §10 | ERC-8004 identity | **partial** | testnet ID exists but describes another agent — gap G3 |
 | §11 | ERC-8183 service integration | **partial** | `negotiate` verified; `notify_funded` unproven — gap G4 |
 | §12 | Testnet for dev, mainnet for production | **done** | both exercised; `[network].default` switches |
-| §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **NOT DONE** | addresses are in `pancake.ADDRESSES`. See gap G5 |
-| §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **partial** | `history[]` has most; missing `agent_id`, `input/output_amount`, `error` — gap G6 |
+| §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **done** | `blockchain._addresses` loads it; pool chosen by fee tier |
+| §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **done** | `history[]` entries carry `agent_id`, `action`, `input_amount`, `output_amount`, `gas_cost_wei`, `verified`, `error` |
 | §15 | Handle 10 named error classes | **partial** | see 2.4 |
 | §16 | Emergency stop; paused = no new transactions, reads continue | **done** | `pause()`; loop checks status each pass |
 | §17/§18 | Marketplace card fields | **partial** | TVL/PnL/utilization present; APR and 30D PnL absent — gap G7 |
-| §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source + testnet/mainnet execution done; no public URL |
-| §20 | README with 15 required sections | **NOT DONE** | gap G8 |
+| §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source + testnet/mainnet execution done; no public URL (needs AWS) |
+| §20 | README with 15 required sections | **done** | `README.md` |
 
 ### 2.4 §15 error handling coverage
 
@@ -111,17 +112,26 @@ and the monitor logs exceptions with a stack trace (§15 closing requirement).
 
 ```
 bnbLpRangeRebalancer/
-├── app/agent/
+├── config/bsc-contracts.json   ★ SHARED address book (§13) — all four agents
+├── README.md                   ★ §20, 15 sections
+├── app/agent/                  Agent Layer — LLM, strategy, risk, key
 │   ├── main.py            A2A entrypoint; boots config guard + monitor loop
 │   ├── executor.py        SellerAgentExecutor (scaffold) — negotiate/notify_funded
 │   ├── signing.py         ERC-8183 money ops (scaffold): quote-sign, submit, settle
-│   ├── lp_signing.py      ★ LP write path — wrap/approve/swap/mint/decrease/collect
-│   ├── pancake.py         ★ V3 reads + all range/tick/liquidity math
+│   ├── lp_signing.py      ★ LP write path — wrap/approve/swap/mint/increase/decrease/collect
+│   ├── risk.py            ★ Risk Engine (§2) — the gate before any signature
+│   ├── blockchain.py      ★ V3 reads + all range/tick/liquidity math (was pancake.py)
 │   ├── strategy.py        ★ monitor loop, six user actions, fee/PnL accounting
 │   ├── tools.py           the LLM-visible tool list (read-only ONLY)
 │   ├── mint_position.py   one-off position bootstrap
-│   ├── test_pancake.py    math tests + live chain checks
+│   ├── test_blockchain.py ★ math tests + live chain checks
+│   ├── test_strategy.py   ★ accounting, locking, config rewriting
+│   ├── test_service.py    ★ REST routes + auth gating
 │   └── studio.toml        network, wallet, LLM, ERC-8183 pricing, [strategy]
+├── app/service/                Service Layer — public surface, holds no key
+│   ├── main.py            REST entrypoint (:8080)
+│   ├── api.py             ★ the §8 routes + §9 metadata
+│   └── studio.toml
 ├── agentcore/             AWS Bedrock AgentCore deploy config + CDK
 └── .studio/               keystore + .env.local — NEVER COMMITTED
 ```
@@ -302,7 +312,13 @@ the write path and the monitor loop. None had fired yet; all were reachable.
 | B13 | Failed rebalance retried at full speed | `_loop` caught everything and re-entered on the next 60s tick. A mint that fails persistently leaves liquidity already withdrawn, so each pass re-sends `collect` — ~1440 paid transactions/day against ~$1.39 of gas | exponential backoff to a ~32min ceiling; counter resets on success |
 | B14 | `fees_24h` counted BNB price moves as income | snapshots stored one combined USDT value; differencing two taken at different prices books the revaluation of the whole historical BNB fee balance as fees. `max(0, …)` hid only the downward half, so the bias was always flattering | store both token sides; value only the **delta** at the current price |
 | B15 | `_persist_token_id` rewrote any table | matched `line.strip().startswith("token_id")` with no section tracking, first hit wins | track the `[table]` header; only rewrite under `[strategy]` |
+| B17 | **Service Layer served DEFAULT strategy params** | `load_studio_toml()` resolves from the CURRENT WORKING DIRECTORY. `app/service/` has its own studio.toml with no `[strategy]` table, so running the service silently fell back to defaults — `token_id 0`, and any tuned `range_pct`/`trigger_pct`/slippage ignored. Found by reading `/strategy` output during the first e2e run | `blockchain.AGENT_STUDIO_TOML` — config always loads from the agent's own file, whatever the cwd |
 | B16 | USDT decimals hardcoded `1e18` | the ratio-balancing step assumed 18 decimals while `pancake.py` reads them. Correct for BSC-USDT; against a 6-decimal stable the imbalance test always trips and the swap size clamps to the whole balance | `pcs._decimals()` for both sides |
+
+B17 only became reachable when the Service Layer was added, and only became
+VISIBLE by calling the API and reading the numbers back — the same way B7 was
+found. A layer that loads config relative to cwd is correct until something
+runs it from a different directory.
 
 B10, B11 and B12 are the ones that could have lost funds. All three are
 *sequencing* faults, not arithmetic: the math was right, the ordering and the
@@ -458,14 +474,14 @@ Ordered by what unblocks the most.
 
 | ID | Gap | Blocked by | Effort |
 |---|---|---|---|
-| **G1** | §8 REST interface (`/health`, `/status`, `/strategy`, `/performance`, `/positions`, `/transactions`, `POST /activate` `/pause` `/execute`) — we serve A2A JSON-RPC instead | nothing — pure code | medium |
-| **G2** | §9 shared metadata JSON endpoint | nothing | small |
+| ~~G1~~ | ~~§8 REST interface~~ — **DONE**: `app/service/` with all 10 routes, control routes fail closed without `$SERVICE_API_KEY` | — | done |
+| ~~G2~~ | ~~§9 shared metadata~~ — **DONE**: `GET /metadata` | — | done |
 | **G3** | §10 ERC-8004 identity describes "fxagent" (prior use of this wallet); name/description are baked into the agentURI at registration and only endpoint/metadata are updatable | fresh wallet | small |
 | **G4** | §11 `notify_funded` never exercised end-to-end (verify → LLM work → storage → on-chain submit). The LLM work step *is* proven | a buyer funding a job in $U; wallet holds 0 U | medium |
-| **G5** | §13 shared `config/bsc-contracts.json`; addresses currently live in `pancake.ADDRESSES`. They *are* on-chain verified as §13 also demands, but the file layout is not as specified | nothing | small |
-| **G6** | §14 log fields `agent_id`, `input_amount`, `output_amount`, `error` missing from history entries | nothing | small |
+| ~~G5~~ | ~~§13 shared address book~~ — **DONE**: `config/bsc-contracts.json`, loaded by `blockchain._addresses`; pool selected by fee tier | — | done |
+| ~~G6~~ | ~~§14 log fields~~ — **DONE**: `agent_id`, `action`, `input_amount`, `output_amount`, `gas_cost_wei`, `verified`, `error` on every history entry | — | done |
 | **G7** | §17/§18 card fields APR and 30D PnL | needs longer history | medium |
-| **G8** | §20 README with the 15 required sections | nothing | small |
+| ~~G8~~ | ~~§20 README~~ — **DONE**: `README.md`, all 15 sections | — | done |
 | **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials | medium |
 | **G10** | §19 public service URL | G9 |  |
 | **G11** | Agents #2–4 (Grid §5, Yield §6, Lending Guardian §7). §21 puts Lending Guardian next | nothing | large |

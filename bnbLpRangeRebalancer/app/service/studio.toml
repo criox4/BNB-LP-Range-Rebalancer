@@ -1,0 +1,44 @@
+[project]
+name = "bnbLpRangeRebalancer-service"
+
+[stack]
+# Service Layer of the spec section 2 two-layer architecture. Unlike the Agent
+# Layer this process is NOT a signer and holds no wallet: it delegates every
+# action to app/agent/strategy.py, which owns the risk engine and the key.
+layer = "service"
+framework = "fastapi"
+runtime = "uvicorn"
+
+[network]
+# Must match app/agent/studio.toml. The service reads the agent's config for
+# everything strategy-related; this is here so the layer is self-describing and
+# `bag doctor` can compare the two.
+default = "bsc-mainnet"
+
+[service]
+# Spec section 8 REST interface, identical across all four marketplace agents.
+port = 8080
+routes = [
+  "GET /health",
+  "GET /status",
+  "GET /strategy",
+  "GET /performance",
+  "GET /positions",
+  "GET /transactions",
+  "GET /metadata",
+  "POST /activate",
+  "POST /pause",
+  "POST /execute",
+]
+# /activate, /pause and /execute move funds. They require X-API-Key ==
+# $SERVICE_API_KEY and refuse with 503 when it is unset — fail closed, because
+# an open /execute is a rebalance any caller can trigger at the agent's expense.
+control_routes_require_api_key = true
+
+[agent]
+# Where the Agent Layer lives, relative to this file. The service imports it
+# directly (same host, shared state file) rather than calling it over HTTP —
+# one deployment unit, two surfaces.
+path = "../agent"
+protocol = "A2A"
+port = 9000

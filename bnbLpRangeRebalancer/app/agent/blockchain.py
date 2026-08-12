@@ -5,9 +5,8 @@ READ-ONLY by the studio definition (see tools.py): every function here is an
 (decrease/collect/swap/mint) belongs in ``signing.py`` as fixed code — never a
 tool the LLM can invoke.
 
-Addresses below were verified live on BSC testnet (chain 97): each periphery
-contract reports the same ``factory()``, and the pool reports ``token0 = USDT``.
-
+Contract addresses come from the SHARED address book (config/bsc-contracts.json,
+spec 13), never from a table in this file — see `_addresses`.
 Two facts that the math depends on, both easy to get backwards:
 
 * ``token0`` is USDT and ``token1`` is WBNB (USDT sorts lower on both BSC
@@ -21,52 +20,110 @@ Two facts that the math depends on, both easy to get backwards:
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from web3 import Web3
 
 from bnbagent_studio_core.networks import get_network
 
-# --- Verified BSC deployment ---------------------------------------------------
-# EVERY address below was verified by calling it on the live chain, not taken
-# from docs. That mattered: docs.pancakeswap.finance lists a "Factory V3"
-# (0x1296b67b...) and "Router V3" (0xEfF92A26...) that have NO CODE on BSC
-# mainnet, and the real mainnet factory is the same 0x0BFbCF9f... as testnet.
+log = logging.getLogger("seller-agent.blockchain")
+
+# --- Shared BSC address book (spec 13) -----------------------------------------
+# Addresses are NOT hardcoded here. Spec 13: "Do NOT allow individual developers
+# to independently hardcode or invent protocol addresses. Create a shared
+# configuration config/bsc-contracts.json". All four marketplace agents read that
+# one file, so a correction lands everywhere at once instead of drifting between
+# four private copies. Every address in it was verified by CALLING it on the live
+# chain — see the file's own _readme for the two traps that caught us.
 #
-# Two traps this table encodes, both confirmed by calling:
-#   * position_manager DIFFERS per network (testnet 0x427bF5b3, mainnet
-#     0x46A15B0b) even though the factory address is IDENTICAL on both.
-#   * quoter_v2 addresses are effectively SWAPPED: both contracts exist on both
-#     chains, but 0xbC203d7f only answers on testnet and 0xB048Bbc1 only on
-#     mainnet — the wrong one reverts with bare "execution reverted: 0x".
-#
-# ponytail: hardcoded table. Move to studio.toml if a third network appears.
-ADDRESSES = {
-    "bsc-testnet": {
-        "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
-        "position_manager": "0x427bF5b37357632377eCbEC9de3626C71A5396c1",
-        "quoter_v2": "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2",
-        "swap_router": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
-        "wbnb": "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd",
-        "usdt": "0x337610d27c682E347C9cD60BD4b3b107C9d34dDd",
-        "pool": "0x2dbB5a4c235164B9f772179A43faca2c71a8abDB",  # fee 500, deepest
-        "fee": 500,
-    },
-    "bsc-mainnet": {
-        "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
-        "position_manager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
-        "quoter_v2": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
-        "swap_router": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
-        "wbnb": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
-        "usdt": "0x55d398326f99059fF775485246999027B3197955",
-        # fee-500 pool, for parity with testnet. The fee-100 pool
-        # (0x172fcD41E0913e95784454622d1c3724f546f849) is ~2x deeper but earns
-        # a fifth the fee rate — pick deliberately before going live.
-        "pool": "0x36696169C63e42cd08ce11f5deeBbCeBae652050",
-        "fee": 500,
-    },
-}
+# Resolution order: $BNB_CONTRACTS_CONFIG, then the nearest config/ directory
+# walking up from this file (so it works from the agent dir, the repo root, or a
+# deployed bundle that ships config/ alongside app/).
+CONTRACTS_FILENAME = "config/bsc-contracts.json"
+
+
+def _contracts_path() -> Path:
+    override = os.environ.get("BNB_CONTRACTS_CONFIG")
+    if override:
+        return Path(override)
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / CONTRACTS_FILENAME
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"shared address book {CONTRACTS_FILENAME} not found above {__file__}; "
+        "set $BNB_CONTRACTS_CONFIG or restore the file (spec 13)"
+    )
+
+
+@lru_cache(maxsize=1)
+def _contracts() -> dict[str, Any]:
+    return json.loads(_contracts_path().read_text())
+
+
+@lru_cache(maxsize=8)
+def _addresses(network: str, fee: int, pair: str = "BNB/USDT") -> dict[str, Any]:
+    """Flatten the shared config into the flat lookup the rest of this file uses.
+
+    The pool is selected BY FEE TIER rather than fixed, because mainnet carries
+    both a fee-500 and a fee-100 BNB/USDT pool: the fee-100 one is ~2x deeper but
+    earns a fifth the rate. Which one this agent uses is a strategy decision
+    (``[strategy].fee``), not an address-book fact.
+    """
+    try:
+        net = _contracts()["networks"][network]
+    except KeyError:
+        raise ValueError(
+            f"network {network!r} is not in {CONTRACTS_FILENAME}; "
+            f"known: {sorted(_contracts()['networks'])}"
+        ) from None
+
+    dex = net["pancakeswap_v3"]
+    pools = dex["pools"].get(pair) or []
+    match = next((p for p in pools if int(p["fee"]) == int(fee)), None)
+    if match is None:
+        raise ValueError(
+            f"no {pair} fee-{fee} pool listed for {network} in {CONTRACTS_FILENAME}; "
+            f"available fees: {sorted(int(p['fee']) for p in pools)}"
+        )
+    return {
+        "chain_id": int(net["chain_id"]),
+        "factory": dex["factory"],
+        "position_manager": dex["position_manager"],
+        "quoter_v2": dex["quoter_v2"],
+        "swap_router": dex["swap_router"],
+        "wbnb": net["tokens"]["wbnb"],
+        "usdt": net["tokens"]["usdt"],
+        "pool": match["address"],
+        "fee": int(match["fee"]),
+    }
+
+
+def supported_networks() -> list[str]:
+    return sorted(_contracts()["networks"])
+
+
+# --- Agent config ---------------------------------------------------------------
+# ALWAYS this file's own studio.toml, never a cwd-relative lookup.
+# `load_studio_toml()` with no argument walks up from the CURRENT WORKING
+# DIRECTORY. The Service Layer (app/service) has its own studio.toml with no
+# [strategy] section, so running from there silently loaded THAT file and fell
+# back to default range_pct / trigger_pct / token_id — a service reporting and
+# acting on parameters the operator never set. Pinning the path makes the
+# answer identical from every process and every cwd.
+AGENT_STUDIO_TOML = Path(__file__).resolve().parent / "studio.toml"
+
+
+def _studio_toml() -> dict[str, Any]:
+    from bnbagent_studio_core import config as _config
+
+    return _config.load_studio_toml(AGENT_STUDIO_TOML) or {}
+
 
 MAX_UINT128 = 2**128 - 1
 
@@ -155,13 +212,10 @@ RPC_RETRY_SLEEP = 0.4
 
 
 def _cfg(network: str) -> dict[str, Any]:
-    try:
-        return ADDRESSES[network]
-    except KeyError:
-        raise ValueError(
-            f"PancakeSwap V3 addresses not configured for network {network!r}; "
-            f"known: {sorted(ADDRESSES)}"
-        ) from None
+    """Addresses for ``network`` at the fee tier this agent trades (spec 4.2:
+    BNB/USDT only in v1)."""
+    cfg = strategy_config()
+    return _addresses(network, int(cfg["fee"]), str(cfg["pair"]))
 
 
 @lru_cache(maxsize=4)
@@ -471,10 +525,8 @@ def default_network() -> str:
     rather than trading against a stranger's position.
     """
     try:
-        from bnbagent_studio_core import config as _config
-
-        name = str(((_config.load_studio_toml() or {}).get("network") or {}).get("default") or "")
-        if name in ADDRESSES:
+        name = str((_studio_toml().get("network") or {}).get("default") or "")
+        if name in supported_networks():
             return name
     except Exception:  # noqa: BLE001
         pass
@@ -499,64 +551,18 @@ def strategy_config() -> dict[str, Any]:
         "max_slippage_pct": 1.0,
     }
     try:
-        from bnbagent_studio_core import config as _config
-
-        cfg.update((_config.load_studio_toml() or {}).get("strategy") or {})
+        cfg.update(_studio_toml().get("strategy") or {})
     except Exception:  # noqa: BLE001 — config is an override, never a hard dep
         pass
     return cfg
 
 
 def check_config_consistency(network: str | None = None) -> list[str]:
-    """Config that is internally inconsistent in ways nothing else catches.
+    """Moved to :mod:`risk` (spec 2's Risk Engine). Re-exported so existing
+    callers and the boot check keep working."""
+    from risk import check_config_consistency as _impl
 
-    Exists because of a real bug: switching ``[network].default`` to mainnet
-    left ``[payments.erc8183].currency`` at the scaffold's prefilled TESTNET
-    token, so the agent signed chain-56 quotes payable in a token that does not
-    exist on mainnet. Every layer was individually correct — only the
-    combination was wrong, and nothing was positioned to notice.
-
-    Returns a list of problem strings (empty when clean).
-    """
-    from bnbagent.networks import BNB_CHAIN_ADDRESSES
-
-    net = network or default_network()
-    problems: list[str] = []
-    try:
-        from bnbagent_studio_core import config as _config
-
-        cfg = _config.load_studio_toml() or {}
-    except Exception as e:  # noqa: BLE001
-        return [f"studio.toml unreadable: {e}"]
-
-    chain_id = {"bsc-mainnet": 56, "bsc-testnet": 97}.get(net)
-    if chain_id is None:
-        return [f"unknown network {net!r}"]
-
-    configured = str(
-        ((cfg.get("payments") or {}).get("erc8183") or {}).get("currency") or ""
-    )
-    expected = BNB_CHAIN_ADDRESSES[chain_id].payment_token
-    if configured and configured.lower() != expected.lower():
-        problems.append(
-            f"[payments.erc8183].currency {configured} is not the U token for "
-            f"{net} (chain {chain_id}); expected {expected}. Quotes would be "
-            f"signed for a token that does not exist on this chain."
-        )
-
-    token_id = int(((cfg.get("strategy") or {}).get("token_id")) or 0)
-    if token_id and net in ADDRESSES:
-        try:
-            pos = get_lp_position(token_id, net)
-            if not pos["is_managed_pair"]:
-                problems.append(
-                    f"[strategy].token_id {token_id} is not a BNB/USDT fee-"
-                    f"{ADDRESSES[net]['fee']} position on {net} — token IDs are "
-                    f"per-network and this one does not belong to this chain."
-                )
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"[strategy].token_id {token_id} unreadable on {net}: {e}")
-    return problems
+    return _impl(network)
 
 
 def managed_token_id() -> int:
@@ -768,4 +774,87 @@ def get_position_summary(token_id: int, network: str = "bsc-testnet") -> dict[st
         "rebalance_reason": decision["reason"],
         "liquidity": get_lp_liquidity(token_id, network),
         "pending_fees": get_pending_fees(token_id, network),
+    }
+
+
+@_retry_rpc
+def verify_position(token_id: int, tx_hash: str | None = None,
+                    network: str = "bsc-testnet") -> dict[str, Any]:
+    """Confirm a position is real, owned, funded, and in range (spec 4.5).
+
+    The last step of the 4.4 workflow ("Verify new position") and the last
+    on-chain check of the 4.8 definition of done. Deliberately re-reads
+    everything from chain state rather than trusting the mint's return values:
+    a mint can succeed and still leave a position that is empty (mins met with
+    a dust deposit) or already out of range (price moved between the quote and
+    the block).
+
+    ``tx_hash`` is optional — when given, its receipt is checked too, so one
+    call answers "did the transaction land AND is the resulting position
+    sound?".
+
+    Returns ``verified`` plus the individual checks, so a caller that fails can
+    see WHICH check failed rather than just that something did.
+    """
+    from bnbagent_studio_core.wallet import get_wallet
+
+    checks: dict[str, Any] = {}
+    problems: list[str] = []
+
+    pos = get_lp_position(token_id, network)
+    checks["exists"] = pos["owner"] is not None
+    if not checks["exists"]:
+        problems.append(f"token_id {token_id} has no owner (burned or never minted)")
+
+    checks["is_managed_pair"] = pos["is_managed_pair"]
+    if not pos["is_managed_pair"]:
+        problems.append(
+            f"token_id {token_id} is not the managed {strategy_config()['pair']} "
+            f"fee-{_cfg(network)['fee']} position"
+        )
+
+    try:
+        expected_owner = Web3.to_checksum_address(get_wallet().address)
+        checks["owned_by_agent"] = pos["owner"] == expected_owner
+        if not checks["owned_by_agent"]:
+            problems.append(f"owned by {pos['owner']}, not this agent ({expected_owner})")
+    except Exception as e:  # noqa: BLE001 — no wallet locally is not a position fault
+        checks["owned_by_agent"] = None
+        log.debug("owner check skipped: %s", e)
+
+    checks["has_liquidity"] = pos["liquidity"] > 0
+    if not checks["has_liquidity"]:
+        problems.append("position holds zero liquidity")
+
+    price = get_bnb_price(network)["price_usdt_per_bnb"]
+    lower, upper = pos["lower_price_usdt_per_bnb"], pos["upper_price_usdt_per_bnb"]
+    checks["in_range"] = lower <= price <= upper
+    if not checks["in_range"]:
+        problems.append(f"price {price:.4f} is outside {lower:.4f}-{upper:.4f}")
+
+    if tx_hash:
+        try:
+            receipt = _w3(network).eth.get_transaction_receipt(tx_hash)
+            checks["tx_confirmed"] = receipt["status"] == 1
+            checks["tx_block"] = receipt["blockNumber"]
+            if receipt["status"] != 1:
+                problems.append(f"transaction {tx_hash} reverted")
+        except Exception as e:  # noqa: BLE001
+            checks["tx_confirmed"] = False
+            problems.append(f"transaction {tx_hash} unreadable: {e}")
+
+    value = get_position_value(token_id, network)
+    return {
+        "token_id": int(token_id),
+        "network": network,
+        "verified": not problems,
+        "checks": checks,
+        "problems": problems,
+        "owner": pos["owner"],
+        "liquidity": pos["liquidity"],
+        "current_price": price,
+        "lower_price": lower,
+        "upper_price": upper,
+        "tvl_usdt": value.get("tvl_usdt", 0.0),
+        "tx_hash": tx_hash,
     }

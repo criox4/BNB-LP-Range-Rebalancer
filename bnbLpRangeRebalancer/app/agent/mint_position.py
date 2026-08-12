@@ -23,7 +23,7 @@ import sys
 from web3 import Web3
 
 import lp_signing as lp
-import pancake as pcs
+import blockchain as pcs
 
 NETWORK = pcs.default_network()
 

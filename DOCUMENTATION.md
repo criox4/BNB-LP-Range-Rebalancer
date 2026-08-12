@@ -6,7 +6,7 @@ is verified on-chain, and what remains. Spec reference throughout is
 
 **Last updated:** 2026-08-12
 **Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
-**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`, `84b02cd`, `39fce37`, `a3f6b31`
+**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`, `84b02cd`, `39fce37`, `a3f6b31`, `43dc55e`, `dc4aad4`, `337039e`
 
 ---
 
@@ -15,9 +15,11 @@ is verified on-chain, and what remains. Spec reference throughout is
 | | |
 |---|---|
 | Strategy logic | complete and exercised on both networks |
-| Testnet position | `36780` (rebalanced from `36779`) |
+| Testnet position | `36799` (rebalanced from `36780`, which came from `36779`) |
 | **Mainnet position** | **`7116214`** (rebalanced from `7116193`), live, in range |
 | Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
+| **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
+| ERC-8004 testnet | `agent_id 1796` — agentURI frozen as `fxagent`; correct name in metadata |
 | Monitor loop | runs inside the A2A runtime, 60s poll |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
@@ -25,8 +27,8 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
-| Blocked on a clean wallet | ERC-8004 identity, key rotation |
-| Blocked on a counterparty | ERC-8183 `notify_funded` (needs a buyer funding in $U) |
+| Blocked on a clean wallet | key rotation; a *production* ERC-8004 identity |
+| Blocked on the kernel | ERC-8183 `notify_funded` — buyer path reverts `PolicyNotWhitelisted()` |
 
 **§4.8 Definition of Done is met**: the agent reads a real PancakeSwap V3
 position, detects the rebalance condition, executes on BSC, the transaction
@@ -34,14 +36,16 @@ confirms, the new position is verified, and the hash is returned. Done on
 testnet and then on mainnet with real funds.
 
 **§22 Final Acceptance is not met** and cannot be by this agent alone — it
-requires all four agents. For Agent #1 specifically, Marketplace API is now
-satisfied; **ERC-8004** and **ERC-8183** are the two criteria still outstanding,
-and both are blocked rather than unbuilt.
+requires all four agents. For Agent #1 specifically, Marketplace API and
+**ERC-8004 are now satisfied on both networks**. **ERC-8183** is the one
+criterion still outstanding: the seller half is verified (a wallet-signed quote,
+§11), but `notify_funded` needs a funded job, and the buyer path is gated —
+see §10.
 
 **Every spec requirement that could be closed by writing code has been closed.**
-What remains needs a fresh wallet, a paying counterparty, AWS credentials,
-elapsed time, or an answer from the spec author — plus agents #2–4, which is
-the bulk of the remaining project.
+What remains needs AWS credentials, a whitelisted buyer policy, elapsed time, or
+an answer from the spec author — plus agents #2–4, which is the bulk of the
+remaining project.
 
 ---
 
@@ -85,15 +89,15 @@ the bulk of the remaining project.
 | §3.1 | LLM must never generate arbitrary calldata | **done** | §4.1 below; enforced + tested |
 | §8 | REST: `/health` `/status` `/strategy` `/performance` `/positions` `/transactions`, `POST /activate` `/pause` `/execute` | **done** | `app/service/api.py`; control routes gated by `$SERVICE_API_KEY`, fail closed |
 | §9 | Shared agent metadata JSON | **done** | `GET /metadata` |
-| §10 | ERC-8004 identity | **partial** | testnet ID exists but describes another agent — gap G3 |
-| §11 | ERC-8183 service integration | **partial** | `negotiate` verified; `notify_funded` unproven — gap G4 |
+| §10 | ERC-8004 identity | **done** | mainnet `265375`, testnet `1796`; both on the throwaway wallet with a frozen `localhost` endpoint — §4.12, gap G3 |
+| §11 | ERC-8183 service integration | **partial** | `negotiate` verified (signed quote, chain 97); `notify_funded` blocked — buyer path reverts `PolicyNotWhitelisted()`, gap G4 |
 | §12 | Testnet for dev, mainnet for production | **done** | both exercised; `[network].default` switches |
 | §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **done** | `blockchain._addresses` loads it; pool chosen by fee tier |
 | §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **done** | `history[]` entries carry `agent_id`, `action`, `input_amount`, `output_amount`, `gas_cost_wei`, `verified`, `error` |
 | §15 | Handle 10 named error classes | **partial** | see 2.4 |
 | §16 | Emergency stop; paused = no new transactions, reads continue | **done** | `pause()`; loop checks status each pass |
 | §17/§18 | Marketplace card fields | **partial** | TVL/PnL/utilization present; APR and 30D PnL absent — gap G7 |
-| §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source + testnet/mainnet execution done; no public URL (needs AWS) |
+| §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source, testnet + mainnet execution, and ERC-8004 IDs done; no public URL (needs AWS) |
 | §20 | README with 15 required sections | **done** | `README.md` |
 
 ### 2.4 §15 error handling coverage
@@ -287,6 +291,38 @@ share* of the shallower fee-500 pool (2.1×) at a 5× higher fee rate — roughl
 10× the fee income per unit of volume. For a $1 position where the goal is
 observing fees at all, fee-500 wins. Recorded in `ADDRESSES` with the tradeoff.
 
+### 4.12 An ERC-8004 registration is immutable — register *last*
+`bag erc8004 register` mints an `agentURI` of the form
+`data:application/json;base64,…`. That is not a pointer to a document; the name,
+description and `services[].endpoint` **are** the document, embedded on-chain.
+
+The consequence is stronger than "the name is fixed". `bag erc8004
+update-endpoint` succeeded on both networks — a confirmed receipt, 158k gas, two
+logs — and the agentURI did not change. The endpoint is as frozen as the name.
+`update-metadata` *does* write, and reads back through `get-metadata`, which is
+why the testnet record now carries the correct name there even though its
+agentURI still says `fxagent`. (`bag erc8004 show` prints `metadata: {}`
+regardless; it does not enumerate keys.)
+
+This was found the expensive way: both registrations were made with the endpoint
+set to the agent-card path rather than the A2A base URL, which made the buyer's
+`--agent-id` resolution 404 on `…/agent-card.json/negotiate`. That mistake is now
+permanent on both chains.
+
+Two things follow, and they invert the plan this session started with:
+
+1. **Order.** A production identity must be registered *after* the public URL
+   exists, not before — the deploy is a prerequisite of registration, not a
+   follow-up to it.
+2. **Escape hatch.** `register --agent-uri` accepts a pre-built URI. Passing an
+   `https://` URL instead of a `data:` blob makes the identity document mutable
+   off-chain, which is the only way to keep a registration correctable.
+
+The mainnet identity is therefore named `BNB LP Rebalancer (Test)` on purpose.
+It proves the §22 ERC-8004 row on a wallet that is already compromised and was
+never going to be the deploy wallet; the real one gets registered once, later,
+against a real URL.
+
 ---
 
 ## 5. Bug log
@@ -334,6 +370,18 @@ B10, B11 and B12 are the ones that could have lost funds. All three are
 *sequencing* faults, not arithmetic: the math was right, the ordering and the
 concurrency were not. That is the same shape as B4.
 
+### Round 3 — found by reading the log a real run produced
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| B18 | §14 `input_amount` logged `0.0` for both tokens | read `pos["tokens_owed0"/"1"]`. V3 only refreshes `tokensOwed` when a position is *touched*, so on an untouched position both read zero — the log recorded a rebalance that consumed nothing, while `get_pending_fees()` (which simulates a `collect`) reported real fees on the same position | derive from `get_position_value` — liquidity → amounts at the live tick, i.e. what the withdrawal actually moves. That call was already being made for `tvl_usdt`, so the fix removes an RPC round trip rather than adding one |
+
+B18 is the B4 family again: `tokensOwed` is a *lazily updated* field, and both
+bugs come from reading it at a moment when it does not mean what it looks like.
+B4 read it after a decrease, when it held principal; B18 read it before any
+interaction, when it held nothing. Neither is visible without executing a
+rebalance and then reading the record it wrote.
+
 ---
 
 ## 6. On-chain evidence
@@ -349,7 +397,23 @@ interaction with a verified agent wallet.
 | Mint → position `36779` | `98b1a8fe22a72f497983be3fd28dcde148f8ec5bca1b197a232d343774fa603e` |
 | Swap WBNB→USDT | `c0cd45744c29bb4596c163c9538bea8286878b58b5208082f0dd80f45d6c6e3e` |
 | Rebalance `36779`→`36780` | `28360b8b…`, `f875e01e…`, `befff314…` |
-| ERC-8004 agent id | `1796` (see gap G3) |
+| **Rebalance `36780`→`36799`** (out-of-range trigger) | `476a88fe…`, `a4c16c0e…`, `b45f4421…`, `0b01f266…` |
+| ERC-8004 agent id | `1796` (agentURI frozen as `fxagent` — see G3) |
+| ERC-8004 metadata `name` | `2ea29e31c795f2fca28af519d01e645ba6a44052a4e02ae56f835e2d8a768f28` |
+| ERC-8004 metadata `description` | `7aaf767a3c2ff600821edfee9f9b8ba2b25eeee7def97287c67b141bfb208354` |
+
+The `36780`→`36799` rebalance is the strongest §4.8 evidence in the project: the
+position was genuinely **out of range** (price $12.69 against a $14.92–$18.24
+band, utilization 234%), not merely near a bound. All six `verify_position`
+checks passed and the replacement landed in range. It is also the first entry
+written with the full §14 field set.
+
+Note it lost value: TVL $0.2504 → $0.1609. That is **price impact, not a
+slippage-guard failure** — the position held 87% of the pool's entire active
+liquidity, so withdrawing and swapping moved the testnet pool against itself.
+The 1% guard bounds movement between quote and execution; it cannot bound the
+impact of being most of the pool. Mainnet's fee-500 pool is deep enough that
+this does not arise (see §4.10).
 
 ### BSC Mainnet (chain 56)
 | Action | Tx / ID |
@@ -358,6 +422,7 @@ interaction with a verified agent wallet.
 | Swap WBNB→USDT | `36c0ca812f0cf29bf44586ac74d715f1fcbba9308e045e72ceb83b3914f2dfbd` |
 | Mint → position `7116193` | `55fdd0a4d688be7eb12dd958146d018ebdfe88b059e6ffc2aa50fac4da9c5c3d` |
 | **Rebalance `7116193`→`7116214`** | `7068e8c3…`, `73890896…`, `4f2e4d57…` (gas $0.019) |
+| **ERC-8004 registration** | `agent_id 265375`, registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` |
 
 Position `7116214`: range $548.22–$670.27, TVL ~$0.81, in range.
 TVL reconciles with the $0.85 committed once the swap fee and $0.04 of WBNB
@@ -510,8 +575,8 @@ on something external.
 | ID | Gap | Blocked by |
 |---|---|---|
 | **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. Acceptable while the wallet holds $0.81 of a throwaway position; not acceptable before real value | a decision |
-| **G3** | §10 ERC-8004 identity describes "fxagent" (prior use of this wallet). Name and description are baked into the agentURI at registration; only endpoint and metadata are updatable | a fresh wallet — same action as G13 |
-| **G4** | §11 `notify_funded` never exercised end-to-end (verify → LLM work → storage → on-chain submit). The LLM work step *is* proven; `negotiate` is verified | a buyer funding a job in $U; wallet holds 0 U |
+| **G3** | §10 ERC-8004 **production** identity. Both networks are now registered, but on the compromised wallet and with a `localhost` endpoint frozen into the agentURI (see §4.12). The mainnet record is deliberately named `BNB LP Rebalancer (Test)` | a fresh wallet (G13) **and** a public URL (G10) — register last, not first |
+| **G4** | §11 `notify_funded` end-to-end (verify → LLM work → storage → on-chain submit). `negotiate` **is** verified — a wallet-signed quote, chain 97, correct $U currency. The buyer leg reverts `PolicyNotWhitelisted()`: the ERC-8183 kernel gates buyer policies, and the SDK documents v1 as seller-only | a whitelisted buyer policy, or an external buyer funding a job |
 | **G7** | §17/§18 card fields APR and 30D PnL | elapsed time — the agent has been watching under 24h |
 | **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials |
 | **G10** | §19 public service URL | G9 |
@@ -529,9 +594,12 @@ on something external.
 | — | §4.1 `increaseLiquidity()` | `lp_signing.increase_liquidity` |
 | — | §4.5 `verify_position()` | `blockchain.verify_position` — the check existed inside `rebalance()` but was not callable |
 | — | §2 `risk.py` / `blockchain.py` | risk logic extracted from `lp_signing`/`strategy`; `pancake.py` renamed |
+| — | §22 ERC-8004 row, both networks | mainnet `agent_id 265375`; testnet `1796` with corrected metadata |
+| — | §14 log fields *demonstrated* | testnet rebalance `36780`→`36799` is the first entry carrying the full set |
+| — | B18 `input_amount` logged zeros | derived from `get_position_value`, not `tokensOwed` (§5 bug log) |
 
-**Note on G13.** It is listed as blocked on "a decision" rather than sized as
-work because rotating is cheap — the expensive part is that G3 depends on it, so
-doing them together is the only sensible order: new wallet → fund → register
-ERC-8004 clean → migrate the position. Doing G3 first would waste the
-registration.
+**Note on G13.** Rotating is cheap; the ordering is what costs. The correct
+sequence is now: **new wallet → fund → deploy (G9/G10) → register ERC-8004 with
+the real public URL → migrate the position.** Registration must come *last*,
+because the endpoint is frozen at registration time — which is the opposite of
+what this session assumed going in. See §4.12.

@@ -67,3 +67,7 @@ max_slippage_pct = 1.0     # swap guard; the testnet pool is shallow enough that
 # does NOT survive deploy. Path from STORAGE_LOCAL_PATH.
 kind = "local"
 
+[identity]
+endpoint = "http://localhost:9000/.well-known/agent-card.json"
+registered_at = "2026-08-12T09:16:09.598559+00:00"
+agent_id = 265375

@@ -185,9 +185,13 @@ codeLocation, so no packaging path can bundle it.
 ```bash
 uv venv && uv pip install -e bnbLpRangeRebalancer
 
+# commit hooks — once per clone. core.hooksPath is local config, so cloning
+# does NOT bring the hook with it; this line is what turns it on.
+git config core.hooksPath .githooks
+
 # tests — offline, no RPC, no wallet
-python bnbLpRangeRebalancer/app/agent/test_blockchain.py     # 14 range/tick/liquidity
-python bnbLpRangeRebalancer/app/agent/test_strategy.py       # 9 accounting/locking
+python bnbLpRangeRebalancer/app/agent/test_blockchain.py     # 20 range/tick/liquidity
+python bnbLpRangeRebalancer/app/agent/test_strategy.py       # 11 accounting/locking
 python bnbLpRangeRebalancer/app/agent/test_service.py        # REST routes + auth
 
 # live read-only smoke against both chains
@@ -208,6 +212,11 @@ python bnbLpRangeRebalancer/app/service/main.py    # REST :8080
 
 Run the monitor loop in exactly one process. Both is safe — the cross-process
 lock refuses the second rebalance rather than duplicating it — but wasteful.
+
+Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org):
+`type(scope): description`, under 72 characters, from `feat fix docs style
+refactor perf test build ci chore revert`. `.githooks/commit-msg` rejects
+anything else; merge, revert and fixup subjects pass through untouched.
 
 ## BSC Testnet Deployment
 

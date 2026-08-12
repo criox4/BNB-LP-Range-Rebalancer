@@ -1,0 +1,38 @@
+#!/bin/sh
+# Reject any subject that is not Conventional Commits.
+#
+# Versioned here rather than in .git/hooks so it survives a clone; activated by
+# `git config core.hooksPath .githooks` (see README "Contributing"). Deliberately
+# POSIX sh with no commitlint/husky/node dependency — this repo is Python, and a
+# 30-line hook does not justify a JS toolchain.
+#
+# Format:  type(optional-scope)!: description
+# Merge, revert, and fixup/squash subjects are left alone; git generates those.
+
+subject=$(sed -n '1{p;q;}' "$1")
+
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"#"*|"") exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+
+if ! printf '%s' "$subject" | grep -Eq "^($types)(\([a-z0-9._-]+\))?!?: .+"; then
+    echo "commit-msg: subject is not a Conventional Commit." >&2
+    echo >&2
+    echo "  got:      $subject" >&2
+    echo "  expected: type(scope): description" >&2
+    echo "  types:    $(printf '%s' "$types" | tr '|' ' ')" >&2
+    echo >&2
+    echo "  e.g. fix(network): route the seller through one network resolver" >&2
+    exit 1
+fi
+
+# 72 keeps `git log --oneline` readable in a terminal and is what the rest of
+# this history already fits in.
+len=$(printf '%s' "$subject" | wc -c | tr -d ' ')
+if [ "$len" -gt 72 ]; then
+    echo "commit-msg: subject is $len characters; keep it under 72." >&2
+    echo "  $subject" >&2
+    exit 1
+fi

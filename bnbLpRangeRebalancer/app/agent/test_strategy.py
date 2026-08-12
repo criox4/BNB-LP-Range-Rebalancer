@@ -124,6 +124,54 @@ def test_rebalance_lock_excludes_a_second_process():
         pass
 
 
+def test_state_dir_is_relocatable_and_stays_per_network():
+    """$LP_STATE_DIR moves state onto durable storage without letting two
+    networks share one file.
+
+    Guards the split: a host whose filesystem is not durable (an AgentCore
+    microVM, a scale-to-zero container) loses the state file, and the state file
+    is the single source of truth for token_id (B10). Relocating it is the fix,
+    but only if the network stays in the FILENAME — point mainnet and testnet at
+    one file and a mainnet rebalance inherits the testnet token_id.
+    """
+    import importlib
+    import os
+
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["LP_STATE_DIR"] = d
+        try:
+            mod = importlib.reload(s)
+            assert mod.STATE_PATH.parent == Path(d), mod.STATE_PATH
+            # The network is in the name, so the two chains cannot collide.
+            assert mod.NETWORK in mod.STATE_PATH.name, mod.STATE_PATH
+            # The lock rides along with the state file, not the old directory.
+            assert mod.LOCK_PATH.parent == Path(d), mod.LOCK_PATH
+        finally:
+            del os.environ["LP_STATE_DIR"]
+            importlib.reload(s)
+
+    # Back to the default (alongside the agent) once the override is gone.
+    assert s.STATE_PATH.parent == Path(s.__file__).parent, s.STATE_PATH
+
+
+def test_monitor_is_opt_in_on_both_halves():
+    """Neither process may start the loop by default.
+
+    The flock in _rebalance_lock is a FILESYSTEM lock: it excludes a second
+    process on the same host and is blind to one on another machine. If the
+    seller and the monitor are split across hosts and either half defaults to
+    running the loop, both rebalance and the B11 guard cannot fire. So the
+    default must be off on both sides, and the check is that neither source
+    starts it unconditionally.
+    """
+    for path, flag in (("main.py", "AGENT_RUN_MONITOR"),
+                       ("../service/main.py", "SERVICE_RUN_MONITOR")):
+        src = (Path(__file__).parent / path).read_text()
+        assert "start_monitor()" in src, f"{path} no longer starts the monitor at all"
+        gate = src.split("start_monitor()")[0]
+        assert flag in gate, f"{path} starts the monitor without checking ${flag}"
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

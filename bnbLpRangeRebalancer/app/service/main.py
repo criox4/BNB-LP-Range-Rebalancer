@@ -9,15 +9,23 @@ same ``strategy.py`` code, not a socket.
 
 ## Which process runs the monitor loop
 
-Exactly one should. ``app/agent/main.py`` starts it at import, so when both are
-running the AGENT owns the loop and this service is a read/control surface over
-the shared state. Running this service ALONE (no agent process) is also valid —
-set ``SERVICE_RUN_MONITOR=1`` and it starts the loop itself.
+Exactly one, chosen explicitly. Neither process starts it by default:
 
-Starting it in both is safe but wasteful: the cross-process ``flock`` in
-``strategy._rebalance_lock`` means the second one's rebalance is refused rather
-than duplicated, so funds are never double-moved — you just get noise in the
-logs. Prefer one.
+    SERVICE_RUN_MONITOR=1   -> this service runs the loop
+    AGENT_RUN_MONITOR=1     -> app/agent/main.py runs it instead
+
+Set neither and nothing polls; both halves say so at startup, ``/health``
+reports it, and ``strategy.is_monitor_running()`` answers it.
+
+Setting BOTH on one host is wasteful but not dangerous: the ``flock`` in
+``strategy._rebalance_lock`` refuses the second process's rebalance rather than
+duplicating it, so funds are never double-moved — you just get noise.
+
+Setting both across TWO HOSTS is dangerous, and is why neither defaults to on.
+An flock is a filesystem lock: it cannot see a process on another machine, so
+both monitors acquire it, both read the same liquidity, and both rebalance. The
+guard is structurally unable to fire. If the seller and the monitor run on
+separate hosts, exactly one of those hosts sets its flag.
 """
 from __future__ import annotations
 
@@ -62,8 +70,9 @@ if __name__ == "__main__":
         strat.start_monitor()
         log.info("monitor loop started by the service layer")
     else:
-        log.info("monitor loop NOT started here (app/agent/main.py owns it); "
-                 "set SERVICE_RUN_MONITOR=1 to run it from the service instead")
+        log.info("monitor loop NOT started here: set SERVICE_RUN_MONITOR=1 to run "
+                 "it in this process, or AGENT_RUN_MONITOR=1 to run it in the "
+                 "A2A agent. Exactly one of the two, and never on two hosts.")
 
     if not os.environ.get("SERVICE_API_KEY"):
         log.warning("SERVICE_API_KEY unset — /activate, /pause and /execute will "

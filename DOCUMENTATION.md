@@ -6,7 +6,7 @@ is verified on-chain, and what remains. Spec reference throughout is
 
 **Last updated:** 2026-08-12
 **Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
-**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`, `84b02cd`, `39fce37`, `a3f6b31`, `43dc55e`, `dc4aad4`, `337039e`
+**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`, `84b02cd`, `39fce37`, `a3f6b31`, `43dc55e`, `dc4aad4`, `337039e`, `+ this one`
 
 ---
 
@@ -20,10 +20,10 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
 | **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
 | ERC-8004 testnet | `agent_id 1796` — agentURI frozen as `fxagent`; correct name in metadata |
-| Monitor loop | runs inside the A2A runtime, 60s poll |
+| Monitor loop | 60s poll; **opt-in** via `$AGENT_RUN_MONITOR` or `$SERVICE_RUN_MONITOR` — exactly one, never two hosts (§11) |
 | Runtime state | **paused** (will not trade unattended) |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 29 offline (14 math + 9 strategy + 6 service) + live address-book / guard / config checks |
+| Tests | 31 offline (14 math + 11 strategy + 6 service) + live address-book / guard / config checks |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
 | Blocked on credentials | AWS deploy, IPFS storage, public URL |
@@ -485,6 +485,11 @@ say so if not).
 |---|---|---|
 | `WALLET_PASSWORD` | unlocks the keystore; sole signer | shell only — never written to disk |
 | `OPENROUTER_API_KEY` | LLM provider | `.studio/.env.local` (gitignored) |
+| `SERVICE_API_KEY` | gates `/activate` `/pause` `/execute`; unset ⇒ they 503 | required to control the agent over HTTP |
+| `AGENT_RUN_MONITOR` | `1` ⇒ the A2A agent runs the monitor loop | **off by default** — see §11 |
+| `SERVICE_RUN_MONITOR` | `1` ⇒ the service layer runs it instead | **off by default**; set exactly one of the two |
+| `LP_STATE_DIR` | relocates the state file onto durable storage | required wherever the filesystem is ephemeral |
+| `AGENT_PORT` / `SERVICE_PORT` | bind ports (default 9000 / 8080) | local dev and self-hosting |
 | `STUDIO_BSC_RPC` / `STUDIO_BSC_TESTNET_RPC` | RPC overrides | optional |
 
 ---
@@ -603,3 +608,89 @@ sequence is now: **new wallet → fund → deploy (G9/G10) → register ERC-8004
 the real public URL → migrate the position.** Registration must come *last*,
 because the endpoint is frozen at registration time — which is the opposite of
 what this session assumed going in. See §4.12.
+
+---
+
+## 11. Deployment split: who runs the monitor
+
+The agent is two long-lived processes over one position:
+
+```
+app/agent/main.py      A2A seller     :9000   negotiate + notify_funded   (signs)
+app/service/main.py    REST API       :8080   §8 routes + /execute        (signs)
+                            │
+                            └── .lp_state.<network>.json   ← ONE writer
+```
+
+**Exactly one process may run the monitor loop, and it is chosen explicitly.**
+Neither starts it by default:
+
+```bash
+AGENT_RUN_MONITOR=1     # the A2A seller polls and rebalances
+SERVICE_RUN_MONITOR=1   # the service layer does instead
+```
+
+### Why opt-in rather than a sensible default
+
+`strategy._rebalance_lock` is an `flock` — a **filesystem** lock. It excludes a
+second process on the same host (that is B11, and `test_strategy.py` proves it by
+forking a real second process). It is blind to a process on another machine.
+
+Split the seller and the monitor across two hosts with either half defaulting to
+on, and both acquire their own local lock, both read the same liquidity, and both
+rebalance. The guard cannot fire — not because it is wrong, but because the
+premise it was written under (one filesystem) no longer holds.
+
+Defaulting off trades a loud, harmless failure for a silent, expensive one. With
+neither flag set nothing polls, and that is visible in three places: both
+processes say so at startup, `/health` reports `monitor_running`, and
+`strategy.is_monitor_running()` answers directly.
+
+Both halves sign from the same EOA, and `lp_signing._send` takes its nonce from
+`pending` with no cross-host coordination. On one host the sends serialise
+naturally; across two, concurrent sends can collide on nonce. Another reason to
+prefer co-location.
+
+### State must outlive the process
+
+`$LP_STATE_DIR` relocates the state file. It names a **directory**, not a file,
+on purpose: the filename carries the network, and letting an operator name the
+file is how mainnet and testnet end up sharing one — handing a mainnet rebalance
+the testnet `token_id`.
+
+This is mandatory wherever the filesystem is ephemeral. On AgentCore the microVM
+is reclaimed after **15 minutes idle** or **8 hours** of lifetime, and only
+`session storage` survives that. Losing the file is not cosmetic:
+
+| Lost | Consequence |
+|---|---|
+| `status` | returns as `paused` — monitoring silently stops |
+| `history`, snapshots | `fees_24h`, APR and 30D PnL can never accumulate (G7 becomes unfixable) |
+| **`token_id`** | falls back to the **bootstrap** id in `studio.toml` — i.e. manages whichever NFT a past rebalance already emptied. **This is B10, reintroduced by the platform rather than the code.** |
+
+**When deploying, copy the existing state file onto the volume first.** A fresh
+directory starts at `rebalance_count: 0` with no history, and the `token_id`
+falls back to the bootstrap value — which is correct only until the first
+rebalance mints a new NFT.
+
+### Verified
+
+| Check | Result |
+|---|---|
+| agent, no flag | `LP monitor NOT started here` |
+| agent, `AGENT_RUN_MONITOR=1` | `monitor loop started (poll=60s)` |
+| service, `SERVICE_RUN_MONITOR=1` | started; `/health` → `monitor_running: true` |
+| `LP_STATE_DIR` | state **and** lock relocate; network stays in the filename; the repo's own state file untouched |
+| guard test | fails on an ungated `start_monitor()` — confirmed against a simulated regression, not assumed |
+
+31 offline tests pass (14 blockchain + 11 strategy + 6 service).
+
+### Not yet decided
+
+Where the always-on host lives. The changes above are host-agnostic: the
+AgentCore entrypoint (`agentcore.json` → `entrypoint: main.py`,
+`codeLocation: app/agent/`) is an ordinary Python program with a `__main__` that
+runs uvicorn, so `python main.py` serves the identical A2A agent on EC2, Railway,
+Fly or a VPS. Self-hosting does drop AgentCore's mandatory authorizer: the
+endpoint is never anonymous there (IAM, or Cognito OAuth2 for external buyers),
+and nothing replaces that automatically.

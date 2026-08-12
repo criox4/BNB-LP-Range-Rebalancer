@@ -249,7 +249,27 @@ try:
     for _problem in check_config_consistency():
         logging.getLogger("seller-agent").error("CONFIG: %s", _problem)
 
-    start_monitor()
+    # EXACTLY ONE process in a deployment may run the loop, and it must be
+    # chosen explicitly — hence opt-in rather than the default.
+    #
+    # `strategy._rebalance_lock` is an flock, which excludes a second process on
+    # the SAME filesystem but cannot see one on another host. Split the seller
+    # and the monitor across two machines with this defaulting to on and both
+    # take the lock, both read the same liquidity, and both rebalance — the B11
+    # race again, with the guard structurally unable to fire.
+    #
+    # Defaulting off trades a loud, harmless failure (no loop; visible in the
+    # logs below, in /health, and in `is_monitor_running()`) for a silent,
+    # expensive one. The service layer's mirror switch is $SERVICE_RUN_MONITOR.
+    if os.environ.get("AGENT_RUN_MONITOR") == "1":
+        start_monitor()
+        logging.getLogger("seller-agent").info(
+            "LP monitor started here (AGENT_RUN_MONITOR=1)")
+    else:
+        logging.getLogger("seller-agent").info(
+            "LP monitor NOT started here: set AGENT_RUN_MONITOR=1 to run it in "
+            "this process, or SERVICE_RUN_MONITOR=1 to run it in the service "
+            "layer. Exactly one of the two, and never on two hosts at once.")
 except Exception as exc:  # noqa: BLE001 — the A2A surface must serve regardless
     logging.getLogger("seller-agent").warning("LP monitor not started: %s", exc)
 

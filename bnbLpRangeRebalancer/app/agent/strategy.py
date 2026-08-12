@@ -19,6 +19,7 @@ import contextlib
 import fcntl
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -56,7 +57,20 @@ def agent_id() -> str:
 
 # Per-network state: a testnet run must never be read as mainnet history
 # (different chain, different token_id, different money).
-STATE_PATH = Path(__file__).parent / f".lp_state.{NETWORK}.json"
+#
+# $LP_STATE_DIR relocates it onto durable storage. A DIRECTORY, deliberately not
+# a full file path: the filename carries the network, and letting an operator
+# name the file directly is how mainnet and testnet end up sharing one — which
+# would hand a mainnet rebalance the testnet token_id.
+#
+# This matters wherever the process filesystem is not durable. On AgentCore the
+# microVM is reclaimed after 15 min idle (or 8h max), taking the state file with
+# it; the agent would then come back `paused` with no history, and — because the
+# state file is the single source of truth for token_id (B10) — fall back to the
+# BOOTSTRAP token_id in studio.toml, i.e. manage whichever NFT a past rebalance
+# already emptied. Point this at a mounted volume there.
+STATE_DIR = Path(os.environ.get("LP_STATE_DIR") or Path(__file__).parent)
+STATE_PATH = STATE_DIR / f".lp_state.{NETWORK}.json"
 POLL_SECONDS = 60
 
 

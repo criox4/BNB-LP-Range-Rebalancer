@@ -15,6 +15,8 @@ asks for a rebalance at the wrong moment gets refused unless ``force=True``.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import threading
@@ -86,6 +88,50 @@ def _update(**fields) -> dict[str, Any]:
         return state
 
 
+def current_token_id() -> int:
+    """The LP NFT this agent manages — ONE source of truth, the state file.
+
+    A rebalance mints a new NFT and writes the state file first; pushing the id
+    back into ``studio.toml`` is best-effort and logs-and-continues on failure
+    (see :func:`_persist_token_id`). Anything that read ``[strategy].token_id``
+    directly would therefore act on the OLD, emptied position after such a
+    failure while ``get_status`` reported on the new one. ``load_state`` seeds
+    itself from studio.toml when the state file has no id, so the toml value is
+    still the bootstrap — just never a second live answer.
+    """
+    token_id = int(load_state().get("token_id") or 0)
+    if token_id <= 0:
+        raise ValueError(
+            "no managed LP position: set [strategy].token_id in studio.toml "
+            "after minting one (see `python mint_position.py`)"
+        )
+    return token_id
+
+
+# A rebalance moves real funds in a multi-transaction sequence, so exactly one
+# may run at a time. ``_lock`` is not enough: it is a threading.Lock, and the
+# documented operator path (`python strategy.py rebalance --force`) is a SECOND
+# PROCESS racing the server's monitor thread. Two concurrent runs each read the
+# same non-zero liquidity and would decrease/swap/mint twice.
+LOCK_PATH = Path(str(STATE_PATH) + ".lock")
+
+
+@contextlib.contextmanager
+def _rebalance_lock():
+    with open(LOCK_PATH, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RuntimeError(
+                "another rebalance is already in progress (lock held on "
+                f"{LOCK_PATH}) — refusing to run a second one"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 # --- Fee / PnL accounting ------------------------------------------------------
 # Spec 4.6 wants fees_24h and pnl. Neither is readable from chain state alone:
 # the pool exposes only fees pending RIGHT NOW, and a rebalance resets that to
@@ -101,41 +147,68 @@ def _to_usdt(usdt: float, bnb: float, price: float) -> float:
     return usdt + bnb * price
 
 
-def fees_earned_usdt(state: dict[str, Any], pending: dict[str, Any], price: float) -> float:
-    """Everything this agent has earned in fees: collected plus still-pending."""
+def fees_earned(state: dict[str, Any], pending: dict[str, Any]) -> tuple[float, float]:
+    """``(usdt, bnb)`` earned in fees so far: collected plus still-pending.
+
+    Kept as two token amounts, NOT a single USDT value, because the BNB side
+    revalues with the price. See :func:`_fees_since`.
+    """
     return (
-        _to_usdt(state["fees_collected_usdt"], state["fees_collected_bnb"], price)
-        + _to_usdt(pending.get("fees_usdt", 0.0), pending.get("fees_bnb", 0.0), price)
+        state["fees_collected_usdt"] + pending.get("fees_usdt", 0.0),
+        state["fees_collected_bnb"] + pending.get("fees_bnb", 0.0),
     )
 
 
-def _record_snapshot(state: dict[str, Any], fees_usdt: float, tvl_usdt: float,
-                     price: float) -> list[dict[str, Any]]:
-    """Append a fee/TVL sample, rate-limited and bounded."""
+def fees_earned_usdt(state: dict[str, Any], pending: dict[str, Any], price: float) -> float:
+    """Everything this agent has earned in fees, valued at ``price``."""
+    return _to_usdt(*fees_earned(state, pending), price)
+
+
+def _record_snapshot(state: dict[str, Any], fees_usdt: float, fees_bnb: float,
+                     tvl_usdt: float, price: float) -> list[dict[str, Any]]:
+    """Append a fee/TVL sample, rate-limited and bounded.
+
+    Both fee token amounts are stored. Storing only their combined USDT value
+    (what this did originally) made the 24h window unusable: differencing two
+    values taken at different BNB prices books the revaluation of the ENTIRE
+    historical BNB fee balance as fees earned in the window.
+    """
     snaps = list(state.get("snapshots") or [])
     now = time.time()
     if snaps and (now - float(snaps[-1]["ts"])) < SNAPSHOT_MIN_GAP_SECONDS:
         return snaps
     snaps.append({"ts": now, "at": _now(), "fees_usdt": fees_usdt,
-                  "tvl_usdt": tvl_usdt, "price": price})
+                  "fees_bnb": fees_bnb, "tvl_usdt": tvl_usdt, "price": price})
     return snaps[-SNAPSHOT_KEEP:]
 
 
-def _fees_since(snaps: list[dict[str, Any]], seconds: float,
-                current_fees: float) -> tuple[float, bool]:
+def _fees_since(snaps: list[dict[str, Any]], seconds: float, current_usdt: float,
+                current_bnb: float, price: float) -> tuple[float, bool]:
     """``(fees earned in the window, window_is_complete)``.
+
+    Each token side is differenced separately and only the DELTA is valued at
+    the current price, so a BNB price move does not masquerade as fee income.
 
     ``window_is_complete`` is False when the agent has not been watching for the
     full window — the figure is then a floor, not a 24h total, and callers must
     say so rather than presenting a partial number as complete.
+
+    Snapshots written before the two-sided format are skipped rather than
+    guessed at; that only costs a shorter window until they age out.
     """
+    snaps = [s for s in snaps if "fees_bnb" in s]
     if not snaps:
         return (0.0, False)
+
+    def delta(s: dict[str, Any]) -> float:
+        return max(0.0, _to_usdt(current_usdt - float(s["fees_usdt"]),
+                                 current_bnb - float(s["fees_bnb"]), price))
+
     cutoff = time.time() - seconds
     older = [s for s in snaps if float(s["ts"]) <= cutoff]
     if older:
-        return (max(0.0, current_fees - float(older[-1]["fees_usdt"])), True)
-    return (max(0.0, current_fees - float(snaps[0]["fees_usdt"])), False)
+        return (delta(older[-1]), True)
+    return (delta(snaps[0]), False)
 
 
 # --- The decision (deterministic; no LLM) --------------------------------------
@@ -144,16 +217,16 @@ def check() -> dict[str, Any]:
 
     Also records the fee/TVL snapshot that fees_24h and pnl are derived from.
     """
-    token_id = pcs.managed_token_id()
+    token_id = current_token_id()
     summary = pcs.get_position_summary(token_id, NETWORK)
     try:
         value = pcs.get_position_value(token_id, NETWORK)
         state = load_state()
-        fees = fees_earned_usdt(state, summary["pending_fees"], summary["current_price"])
+        f_usdt, f_bnb = fees_earned(state, summary["pending_fees"])
         _update(
             last_check=_now(),
             snapshots=_record_snapshot(
-                state, fees, value.get("tvl_usdt", 0.0), summary["current_price"]
+                state, f_usdt, f_bnb, value.get("tvl_usdt", 0.0), summary["current_price"]
             ),
         )
     except Exception as e:  # noqa: BLE001 — accounting must not break monitoring
@@ -165,7 +238,7 @@ def check() -> dict[str, Any]:
 # --- The six user actions (spec 4.7) -------------------------------------------
 def activate() -> dict[str, Any]:
     """Start autonomous monitoring."""
-    pcs.managed_token_id()  # refuse to activate without a managed position
+    current_token_id()  # refuse to activate without a managed position
     state = _update(status="active")
     log.info("activated (token_id=%s)", state["token_id"])
     return {"status": "active", "token_id": state["token_id"], "since": _now()}
@@ -193,9 +266,12 @@ def get_status() -> dict[str, Any]:
         tvl = pcs.get_position_value(s["token_id"], NETWORK).get("tvl_usdt", 0.0)
     except Exception:  # noqa: BLE001
         tvl = 0.0
-    earned = fees_earned_usdt(state, fees, price)
+    f_usdt, f_bnb = fees_earned(state, fees)
+    earned = _to_usdt(f_usdt, f_bnb, price)
     gas_usdt = state["gas_spent_wei"] / 1e18 * price
-    fees_24h, complete_24h = _fees_since(state.get("snapshots") or [], 86400, earned)
+    fees_24h, complete_24h = _fees_since(
+        state.get("snapshots") or [], 86400, f_usdt, f_bnb, price
+    )
     return {
         "agent": "BNB LP Rebalancer",
         "category": "rebalancing",
@@ -299,9 +375,12 @@ def get_performance() -> dict[str, Any]:
         tvl = pcs.get_position_value(state["token_id"], NETWORK).get("tvl_usdt", 0.0)
     except Exception:  # noqa: BLE001
         pass
-    earned = fees_earned_usdt(state, pending, price)
+    f_usdt, f_bnb = fees_earned(state, pending)
+    earned = _to_usdt(f_usdt, f_bnb, price)
     gas_usdt = state["gas_spent_wei"] / 1e18 * price
-    fees_24h, complete_24h = _fees_since(state.get("snapshots") or [], 86400, earned)
+    fees_24h, complete_24h = _fees_since(
+        state.get("snapshots") or [], 86400, f_usdt, f_bnb, price
+    )
     return {
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],
@@ -340,12 +419,19 @@ def rebalance(force: bool = False) -> dict[str, Any]:
     """
     from bnbagent_studio_core.wallet import get_wallet
 
-    token_id = pcs.managed_token_id()
+    token_id = current_token_id()
     summary = pcs.get_position_summary(token_id, NETWORK)
     if not summary["rebalance_required"] and not force:
         return {"rebalanced": False, "reason": summary["rebalance_reason"],
                 "range_utilization": summary["range_utilization"]}
 
+    with _rebalance_lock():
+        return _do_rebalance(token_id, summary, get_wallet)
+
+
+def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[str, Any]:
+    """The fund-moving sequence itself. Only ever called under
+    :func:`_rebalance_lock`."""
     owner = Web3.to_checksum_address(get_wallet().address)
     cfg = pcs._cfg(NETWORK)
     pos = pcs.get_lp_position(token_id, NETWORK)
@@ -373,18 +459,24 @@ def rebalance(force: bool = False) -> dict[str, Any]:
     rng = pcs.calculate_rebalance_range(price, float(pcs.strategy_config()["range_pct"]))
 
     # 4. Rebalance the token ratio to ~50/50 by value so both sides can be used.
+    # Decimals are read from the tokens, not assumed to be 18. They ARE 18 for
+    # BSC-USDT on both chains, but a hardcoded 1e18 against a 6-decimal stable
+    # would be off by 1e12 — the imbalance test would always trip and the swap
+    # size would be clamped to the entire balance every single rebalance.
+    d_usdt = pcs._decimals(NETWORK, cfg["usdt"])
+    d_wbnb = pcs._decimals(NETWORK, cfg["wbnb"])
     usdt, wbnb = _balance(cfg["usdt"], owner), _balance(cfg["wbnb"], owner)
-    wbnb_value_usdt = wbnb / 1e18 * price
-    usdt_value = usdt / 1e18
+    wbnb_value_usdt = wbnb / 10**d_wbnb * price
+    usdt_value = usdt / 10**d_usdt
     gap = abs(wbnb_value_usdt - usdt_value)
     if gap > 0.05 * max(wbnb_value_usdt + usdt_value, 1e-9):  # >5% off balance
         if wbnb_value_usdt > usdt_value:
-            swap_wei = int((gap / 2) / price * 1e18)
+            swap_wei = int((gap / 2) / price * 10**d_wbnb)
             if swap_wei > 0:
                 r = lp.execute_swap(cfg["wbnb"], cfg["usdt"], min(swap_wei, wbnb), network=NETWORK)
                 txs.append(r["tx_hash"]); gas += r["gas_cost_wei"]
         else:
-            swap_wei = int((gap / 2) * 1e18)
+            swap_wei = int((gap / 2) * 10**d_usdt)
             if swap_wei > 0:
                 r = lp.execute_swap(cfg["usdt"], cfg["wbnb"], min(swap_wei, usdt), network=NETWORK)
                 txs.append(r["tx_hash"]); gas += r["gas_cost_wei"]
@@ -424,17 +516,27 @@ def rebalance(force: bool = False) -> dict[str, Any]:
             "in_range": verified["in_range"]}
 
 
-def _persist_token_id(token_id: int) -> None:
+def _persist_token_id(token_id: int, path: Path | None = None) -> None:
     """Point [strategy].token_id at the replacement position.
 
-    A rebalance mints a NEW NFT, so without this a restart would go back to
-    managing the old, now-empty one.
+    Convenience only — :func:`current_token_id` reads the state file, so a
+    failure here no longer splits the agent's idea of which NFT it manages. It
+    keeps a fresh checkout (empty state file) pointed at the right position.
+
+    Scoped to the ``[strategy]`` table: a bare "first line starting with
+    token_id" scan would rewrite an unrelated ``token_id`` in any earlier
+    section.
     """
-    path = Path(__file__).parent / "studio.toml"
+    path = path or Path(__file__).parent / "studio.toml"
     try:
         lines = path.read_text().splitlines(keepends=True)
+        section = ""
         for i, line in enumerate(lines):
-            if line.strip().startswith("token_id"):
+            stripped = line.strip()
+            if stripped.startswith("["):
+                section = stripped.strip("[]")
+                continue
+            if section == "strategy" and stripped.startswith("token_id"):
                 comment = line.split("#", 1)
                 suffix = f"  #{comment[1]}" if len(comment) > 1 else "\n"
                 lines[i] = f"token_id = {token_id}{suffix if suffix.endswith(chr(10)) else suffix + chr(10)}"
@@ -450,7 +552,15 @@ _thread: threading.Thread | None = None
 _stop = threading.Event()
 
 
+# A failing pass must not be retried at full speed. A rebalance that dies at the
+# mint leaves the liquidity already withdrawn, so every retry re-sends collect
+# (and possibly a swap) before failing again — at a 60s poll that is ~1440 paid
+# transactions a day against a wallet holding a couple of dollars of gas.
+MAX_BACKOFF_MULTIPLIER = 32  # 60s -> ~32min between attempts at the ceiling
+
+
 def _loop() -> None:
+    failures = 0
     while not _stop.is_set():
         try:
             if load_state()["status"] == "active":
@@ -460,9 +570,14 @@ def _loop() -> None:
                          summary["rebalance_required"])
                 if summary["rebalance_required"]:
                     log.info("rebalance result: %s", rebalance())
+            failures = 0
         except Exception as e:  # noqa: BLE001 — the loop must survive any single failure
-            log.exception("monitor pass failed: %s", e)
-        _stop.wait(POLL_SECONDS)
+            failures += 1
+            log.exception("monitor pass failed (%s consecutive): %s", failures, e)
+        backoff = min(2 ** failures, MAX_BACKOFF_MULTIPLIER) if failures else 1
+        if backoff > 1:
+            log.warning("backing off %ss before the next pass", POLL_SECONDS * backoff)
+        _stop.wait(POLL_SECONDS * backoff)
 
 
 def start_monitor() -> None:

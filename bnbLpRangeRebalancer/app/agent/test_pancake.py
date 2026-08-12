@@ -178,24 +178,29 @@ def test_zero_liquidity_has_no_amounts():
 
 
 def test_fees_since_window_incompleteness_is_reported():
-    """A short watch window must never be presented as a full 24h figure."""
+    """A short watch window must never be presented as a full 24h figure.
+
+    The rest of the fee-accounting tests (price neutrality, legacy snapshots)
+    live in test_strategy.py alongside the locking and studio.toml tests.
+    """
     import time as _t
 
     from strategy import _fees_since
 
     now = _t.time()
     # Only 1h of history: the window is incomplete.
-    recent = [{"ts": now - 3600, "fees_usdt": 1.0}]
-    val, complete = _fees_since(recent, 86400, 3.0)
+    recent = [{"ts": now - 3600, "fees_usdt": 1.0, "fees_bnb": 0.0}]
+    val, complete = _fees_since(recent, 86400, 3.0, 0.0, 600.0)
     assert val == 2.0 and complete is False, (val, complete)
 
     # A sample older than 24h completes the window.
-    old = [{"ts": now - 90000, "fees_usdt": 1.0}, {"ts": now - 3600, "fees_usdt": 2.5}]
-    val, complete = _fees_since(old, 86400, 3.0)
+    old = [{"ts": now - 90000, "fees_usdt": 1.0, "fees_bnb": 0.0},
+           {"ts": now - 3600, "fees_usdt": 2.5, "fees_bnb": 0.0}]
+    val, complete = _fees_since(old, 86400, 3.0, 0.0, 600.0)
     assert val == 2.0 and complete is True, (val, complete)
 
     # No history at all.
-    assert _fees_since([], 86400, 5.0) == (0.0, False)
+    assert _fees_since([], 86400, 5.0, 0.0, 600.0) == (0.0, False)
 
 
 def _live_smoke():

@@ -289,6 +289,25 @@ B4, B5 and B9 were only observable *after* a real rebalance ran — a dry run
 would have shown none of them. B7 was only observable by calling `negotiate` and
 reading the signed terms back.
 
+### Round 2 — found by code review, before they fired
+
+B1–B9 were found by running the agent. The next seven came out of a review of
+the write path and the monitor loop. None had fired yet; all were reachable.
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| B10 | **Two sources of truth for `token_id`** | `check`/`rebalance` read `[strategy].token_id` from studio.toml while `getStatus`/`getPerformance` read the state file, and `_persist_token_id` logs-and-continues on failure. One failed toml write and the agent manages the old, emptied NFT while reporting on the new one | `current_token_id()` — state file only. studio.toml is bootstrap, never a second live answer |
+| B11 | **`rebalance()` had no mutual exclusion** | `_lock` is a `threading.Lock` covering only state writes. The documented operator path (`python strategy.py rebalance --force`) is a **separate process** racing the server's monitor thread; both read the same liquidity and both act | `flock`-based `_rebalance_lock()` around the whole sequence |
+| B12 | **Withdrawal had no slippage floor** | `decrease_liquidity` defaulted `amount0Min = amount1Min = 0` — the one unprotected leg. A V3 withdrawal's token split follows the current tick, so a searcher who pushes price to a bound in-block makes the position pay out entirely in the cheap side, then restores it | mins derived from `liquidity_to_amounts` at the live tick, floored by `max_slippage_pct` — same shape as the mint |
+| B13 | Failed rebalance retried at full speed | `_loop` caught everything and re-entered on the next 60s tick. A mint that fails persistently leaves liquidity already withdrawn, so each pass re-sends `collect` — ~1440 paid transactions/day against ~$1.39 of gas | exponential backoff to a ~32min ceiling; counter resets on success |
+| B14 | `fees_24h` counted BNB price moves as income | snapshots stored one combined USDT value; differencing two taken at different prices books the revaluation of the whole historical BNB fee balance as fees. `max(0, …)` hid only the downward half, so the bias was always flattering | store both token sides; value only the **delta** at the current price |
+| B15 | `_persist_token_id` rewrote any table | matched `line.strip().startswith("token_id")` with no section tracking, first hit wins | track the `[table]` header; only rewrite under `[strategy]` |
+| B16 | USDT decimals hardcoded `1e18` | the ratio-balancing step assumed 18 decimals while `pancake.py` reads them. Correct for BSC-USDT; against a 6-decimal stable the imbalance test always trips and the swap size clamps to the whole balance | `pcs._decimals()` for both sides |
+
+B10, B11 and B12 are the ones that could have lost funds. All three are
+*sequencing* faults, not arithmetic: the math was right, the ordering and the
+concurrency were not. That is the same shape as B4.
+
 ---
 
 ## 6. On-chain evidence
@@ -400,7 +419,18 @@ say so if not).
 
 ## 9. Tests
 
-`test_pancake.py` — 14 offline + 4 live groups.
+`test_pancake.py` — 14 offline + 4 live groups. `test_strategy.py` — 9 offline,
+all pure (no RPC, no wallet, no transaction).
+
+| Test (`test_strategy.py`) | Guards against |
+|---|---|
+| `test_fees_since_is_price_neutral` | B14 — a BNB price move reading as fee income |
+| `test_fees_since_counts_real_fees` | the B14 fix over-correcting to zero |
+| `test_fees_since_skips_legacy_snapshots` | old one-sided snapshots being misread |
+| `test_persist_token_id_is_section_scoped` | B15 — clobbering an unrelated `token_id` |
+| `test_persist_token_id_survives_a_missing_file` | the best-effort contract B10 relies on |
+| `test_rebalance_lock_excludes_a_second_process` | B11 — spawns a real second process |
+
 
 | Test | Guards against |
 |---|---|

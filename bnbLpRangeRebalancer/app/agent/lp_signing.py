@@ -325,10 +325,20 @@ def mint_position(amount_usdt_wei: int, amount_wbnb_wei: int,
     return result
 
 
-def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int = 0,
-                       amount1_min: int = 0, network: str = "bsc-testnet") -> dict[str, Any]:
+def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int | None = None,
+                       amount1_min: int | None = None,
+                       network: str = "bsc-testnet") -> dict[str, Any]:
     """Remove ``liquidity`` from a position. Tokens land in the position's
-    owed balance — ``collect_fees`` then sweeps them to the wallet."""
+    owed balance — ``collect_fees`` then sweeps them to the wallet.
+
+    Like :func:`mint_position`, the mins are DERIVED when not given: predict the
+    payout at the live tick and floor it by ``[strategy].max_slippage_pct``.
+    Withdrawing with mins of 0 (the old default) was the one unprotected leg of
+    the rebalance — the token split of a V3 withdrawal depends on the current
+    tick, so a searcher who pushes the price to a bound in the same block makes
+    the position pay out entirely in whichever token just became the cheap side,
+    then restores the price. Pass 0 explicitly to opt out.
+    """
     if liquidity <= 0:
         raise ValueError("liquidity must be positive")
     pos = pcs.get_lp_position(token_id, network)
@@ -338,6 +348,19 @@ def decrease_liquidity(token_id: int, liquidity: int, amount0_min: int = 0,
         )
     if liquidity > pos["liquidity"]:
         raise ValueError(f"position has {pos['liquidity']} liquidity, asked to remove {liquidity}")
+
+    if amount0_min is None or amount1_min is None:
+        slip = float(pcs.strategy_config()["max_slippage_pct"]) / 100.0
+        sqrt_price_x96 = int(pcs._pool(network).functions.slot0().call()[0])
+        exp0, exp1 = pcs.liquidity_to_amounts(
+            liquidity, sqrt_price_x96, pos["tick_lower"], pos["tick_upper"]
+        )
+        if amount0_min is None:
+            amount0_min = int(exp0 * (1 - slip))
+        if amount1_min is None:
+            amount1_min = int(exp1 * (1 - slip))
+        log.info("decrease mins: expected (%s, %s) -> floor (%s, %s) at %.2f%%",
+                 exp0, exp1, amount0_min, amount1_min, slip * 100)
 
     npm = _contract(network, pcs._cfg(network)["position_manager"], NPM_WRITE_ABI)
     return _send(network, npm.functions.decreaseLiquidity(

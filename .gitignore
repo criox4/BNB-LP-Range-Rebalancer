@@ -12,6 +12,9 @@
 # Local operational state, not source. It records real tx hashes but no secrets.
 .lp_state.*.json
 
+# Cross-process rebalance mutex (flock target). Runtime only.
+.lp_state.*.json.lock
+
 # Python
 __pycache__/
 *.py[cod]

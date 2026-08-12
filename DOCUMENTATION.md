@@ -324,6 +324,37 @@ It proves the §22 ERC-8004 row on a wallet that is already compromised and was
 never going to be the deploy wallet; the real one gets registered once, later,
 against a real URL.
 
+### 4.13 ERC-8183 buying is broken on testnet, not in our code
+
+`bag erc8183 buy` reverts at step 2 of 4 (`create_job` → **`register_job`** →
+`set_budget` → `fund`) with `0xc94463e3` = `PolicyNotWhitelisted()`.
+
+Established by elimination, then confirmed directly on-chain:
+
+1. **Not self-dealing.** First seen buying from the agent's own wallet. A second,
+   unrelated buyer wallet (`0x3b5Da020…659C`, funded with 0.06 tBNB + 2 U) gives
+   the identical revert.
+2. **Not our code.** `EvaluatorRouter.registerJob(job_id, policy)` checks a
+   `policyWhitelist` mapping. Reading it directly:
+
+   | chain | configured policy | `policyWhitelist` |
+   |---|---|---|
+   | 97 testnet | `0x4F4678D4…78A6` | **false** |
+   | 56 mainnet | `0x9C018457…6dE5` | **true** |
+
+3. **Not fixable by us.** `setPolicyWhitelist` is owner-only; the testnet router
+   owner is `0x1001b2C0…D134` (the SDK's own treasury address), not a wallet we
+   hold.
+4. **Nobody else is using it either.** Zero `JobRegistered` and zero
+   `PolicyWhitelisted` events on the testnet router across the last 45k blocks
+   (~1.5 days).
+
+So the ERC-8183 job lifecycle is functional on **mainnet** and unusable on
+**testnet** with this SDK version. That inverts the usual "develop on testnet
+first" order for this one flow, and it is the whole of G4: our seller half is
+built and verified, and the missing evidence is gated on someone else's
+allowlist. Worth reporting upstream.
+
 ---
 
 ## 5. Bug log
@@ -590,7 +621,7 @@ on something external.
 |---|---|---|
 | **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. Acceptable while the wallet holds $0.81 of a throwaway position; not acceptable before real value | a decision |
 | **G3** | §10 ERC-8004 **production** identity. Both networks are now registered, but on the compromised wallet and with a `localhost` endpoint frozen into the agentURI (see §4.12). The mainnet record is deliberately named `BNB LP Rebalancer (Test)` | a fresh wallet (G13) **and** a public URL (G10) — register last, not first |
-| **G4** | §11 `notify_funded` end-to-end (verify → LLM work → storage → on-chain submit). `negotiate` **is** verified — a wallet-signed quote, chain 97, correct $U currency. The buyer leg reverts `PolicyNotWhitelisted()`: the ERC-8183 kernel gates buyer policies, and the SDK documents v1 as seller-only | a whitelisted buyer policy, or an external buyer funding a job |
+| **G4** | §11 `notify_funded` end-to-end. `negotiate` **is** verified (wallet-signed quote, chain 97). The buyer leg reverts `PolicyNotWhitelisted()` — **root-caused, see §4.13: the SDK's policy is whitelisted on mainnet and NOT on testnet.** Not fixable by us; `setPolicyWhitelist` is owner-only | running the flow on **mainnet** (needs buyer $U), or the SDK operators whitelisting the testnet policy |
 | **G7** | §17/§18 card fields APR and 30D PnL | elapsed time — the agent has been watching under 24h |
 | **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials |
 | **G10** | §19 public service URL | G9 |

@@ -6,7 +6,8 @@ is verified on-chain, and what remains. Spec reference throughout is
 
 **Last updated:** 2026-08-12
 **Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
-**Repo commits:** `840cf71`, `bb00d8d`, `22e92bb`, `0a000d2`, `84b02cd`, `39fce37`, `a3f6b31`, `43dc55e`, `dc4aad4`, `337039e`, `b20c7a2`, `9a5061a`
+**Repo commits:** `c4374cf`, `1c259d4`, `86884d9`, `f7c518d`, `aae0a34`, `dbea070`, `ba303b2`, `36be8c1`, `1274f9d`, `57c866d`, `c41df14`, `aaa3e3c`, `76e97b3`, `3386717`, `b7f3f2d`, `aef1c4e`, `7731cdc`, `1cb6d84`, `14df2ba`
+(rewritten to Conventional Commits; the pre-rewrite history is tagged `backup-pre-conventional`)
 
 ---
 

@@ -739,6 +739,7 @@ rebalance mints a new NFT.
 | agent, no flag | `LP monitor NOT started here` |
 | agent, `AGENT_RUN_MONITOR=1` | `monitor loop started (poll=60s)` |
 | service, `SERVICE_RUN_MONITOR=1` | started; `/health` → `monitor_running: true` |
+| **monitor on MAINNET** | 2026-08-13: three 60s passes against position `7116214` (`price=613.56 util=7.1% required=False`), `last_check` advancing over `/health` from a **second process**. Activated and paused through the gated routes; `/activate` returns 401 with no key and with a wrong key | |
 | `LP_STATE_DIR` | state **and** lock relocate; network stays in the filename; the repo's own state file untouched |
 | guard test | fails on an ungated `start_monitor()` — confirmed against a simulated regression, not assumed |
 

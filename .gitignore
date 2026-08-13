@@ -15,6 +15,13 @@
 # Cross-process rebalance mutex (flock target). Runtime only.
 .lp_state.*.json.lock
 
+# The SQLite store that replaced the JSON file (B24). Note the missing leading
+# dot — the rules above do NOT cover it, so without this a `git add -A` commits
+# live mainnet position history to a public repo. -wal/-shm are its sidecars.
+lp_state.*.db
+lp_state.*.db-wal
+lp_state.*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]

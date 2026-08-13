@@ -289,5 +289,34 @@ def test_llm_tools_never_expose_a_raw_liquidity_integer():
     assert safe["price"] == 613.44
     assert safe["token_id"] == 7116214
 
+
+# --- spec 17/18 card fields must never fabricate a window ---------------------
+def test_apr_is_none_when_it_cannot_be_annualised():
+    """"0%" and "no data" are different claims about a yield."""
+    assert s._apr_pct(1.0, 0, 100.0) is None        # no observed window
+    assert s._apr_pct(1.0, 86400, 0.0) is None      # no TVL to yield ON
+    # 1% of TVL earned in a day annualises to ~365%.
+    apr = s._apr_pct(1.0, 86400, 100.0)
+    assert abs(apr - 365.0) < 1e-6, apr
+
+
+def test_observed_window_needs_two_samples():
+    assert s._observed_window_seconds([]) == 0.0
+    assert s._observed_window_seconds([{"ts": 100.0}]) == 0.0
+    assert s._observed_window_seconds([{"ts": 100.0}, {"ts": 460.0}]) == 360.0
+
+
+def test_pnl_30d_is_withheld_until_the_window_is_complete():
+    """The agent has watched for days. A 30D figure would be a fabrication.
+
+    Mirrors fees_24h_window_complete (B14): report the flag, not a number that
+    silently means something narrower than its label.
+    """
+    snaps = [{"ts": time.time() - 3600, "fees_usdt": 0.0, "fees_bnb": 0.0}]
+    _, complete = s._fees_since(snaps, s.THIRTY_DAYS, 1.0, 0.0, price=600.0)
+    assert complete is False
+
+
+
 if __name__ == "__main__":
     main()

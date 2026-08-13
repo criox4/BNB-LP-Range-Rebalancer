@@ -96,7 +96,7 @@ remaining project.
 | §14 | Log timestamp, action, protocol, chain_id, tx hash, gas_used, gas_cost, amounts, status, error | **done** | `history[]` entries carry `agent_id`, `action`, `input_amount`, `output_amount`, `gas_cost_wei`, `verified`, `error` |
 | §15 | Handle 10 named error classes | **done** | all ten; see 2.4 |
 | §16 | Emergency stop; paused = no new transactions, reads continue | **done** | `pause()`; loop checks status each pass |
-| §17/§18 | Marketplace card fields | **partial** | TVL/PnL/utilization present; APR and 30D PnL absent — gap G7 |
+| §17/§18 | Marketplace card fields | **done** | TVL, PnL, utilization, APR and 30D PnL; the two windowed fields carry completeness flags rather than implying history the agent has not observed |
 | §19 | Deliverables incl. public URL, both deployments, ERC-8004 ID | **partial** | source, testnet + mainnet execution, and ERC-8004 IDs done; no public URL (needs AWS) |
 | §20 | README with 15 required sections | **done** | `README.md` |
 
@@ -497,6 +497,7 @@ this does not arise (see §4.10).
 | **Rebalance `7116193`→`7116214`** | `7068e8c3…`, `73890896…`, `4f2e4d57…` (gas $0.019) |
 | **ERC-8004 registration** | `agent_id 265375`, registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` |
 | **ERC-8183 job `56587` submitted** | `4bd0271912b1dc9aa2e7f80c9b858db5d4ba3481401f2ff146a72ea9417d6836` (block 115539760) |
+| **ERC-8183 job `56590`, the fixes proven** | create `0xef1661d1…`, register `0x6c253489…`, set_budget `0x1a6e5584…`, fund `0xe21479d2…`, submit `0xe3b87d79…`. Delivered **TVL 0.8126 USDT** (B25 fixed), carried APR and 30D PnL with their window flags (G7), and wrote a durable audit record (B26). The buyer fetched it over HTTP |
 | **ERC-8183 job `56589`, containerised** | create `0xeb94d345…`, register `0xb6d5c031…`, set_budget `0xe68eb6f6…`, fund `0x7d3df15a…`, submit `0x41f55948…`. Delivered from the Docker image, deliverable fetched back over HTTP. Its report carried the B25 TVL error |
 | **ERC-8183 job `56588`, full buyer flow** | create `0x964acf96…`, register `0x41ddaf73…`, set_budget `0xdc703804…`, fund `0xe0bd8962…`, **submit `0x41288736…`** (status 1, block 115657374). Buyer `0xFAf0ffd1…`, 0.1 U, negotiated over A2A with a signed quote (`negotiation_hash 0xfa050296…`) |
 | Buyer top-up swap | approve `0x02607273…`, WBNB→U `0xbebc36c6…` (0.0003 BNB → 0.1839 U on the fee-500 U/WBNB pool; the other three tiers exist but hold no liquidity) |
@@ -661,7 +662,6 @@ on something external.
 | **G3** | §10 ERC-8004 **production** identity. Both networks are registered on the compromised wallet with `localhost` endpoints. Name/description/endpoint are all rewritable on-chain (§4.12), so this is now a `setAgentURI` call once a public URL exists — not a re-registration. The wallet is the only part that cannot be edited | a fresh wallet (G13) for the *owner*; a public URL (G10) for the endpoint |
 | **G14** | Settle job `56587` (`approve` → `COMPLETED`). Calling it early reverts `0x17be5b7b` | the 24h dispute window |
 | **G15** | `deliverable_url` is fetchable now (B23 fixed) but points at **`localhost`**, and `[storage].kind = "local"` keeps the manifest on one machine's disk. Fine for a local buyer; a remote one needs a public URL, and surviving a redeploy needs IPFS | G9/G10 |
-| **G7** | §17/§18 card fields APR and 30D PnL | elapsed time — the agent has been watching under 24h |
 | **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials |
 | **G10** | §19 public service URL | G9 |
 | **G12** | `range_utilization` definition (§4.6). Ours is distance-from-centre; the spec's own example (704.21 in 630–770 → 87) is not reproducible from those numbers under any reading we found | an answer from the spec author |
@@ -681,6 +681,7 @@ on something external.
 | — | §22 ERC-8004 row, both networks | mainnet `agent_id 265375`; testnet `1796` with corrected metadata |
 | — | §14 log fields *demonstrated* | testnet rebalance `36780`→`36799` is the first entry carrying the full set |
 | — | B18 `input_amount` logged zeros | derived from `get_position_value`, not `tokensOwed` (§5 bug log) |
+| ~~G7~~ | §17/§18 card fields APR and 30D PnL | both present, each with the flag that says whether its window is real. `apr` is **None**, not 0, when the basis is too thin to annualise, and `pnl_30d` is withheld until 30 days are actually observed — the same discipline B14 forced on `fees_24h`. Was filed as "blocked on elapsed time"; the fields were implementable all along, it was the *unqualified* versions that needed the wait |
 | ~~G4~~ | §11 `notify_funded` end-to-end | **mainnet job `56587`**: `negotiate` over A2A → `create` → `register` → `set_budget` → `fund` → `notify_funded` → on-chain `submit`, `SUBMITTED` (§6). `register` is the step that reverts on testnet, which confirms §4.13 exactly. Two things the flow required and nothing documented: `ERC8183_AGENT_URL` must point at the seller's `/erc8183` mount, and the budget must **equal** the quoted price, not exceed it |
 
 **Note on G13.** Rotating is cheap; the ordering is what costs. The correct

@@ -310,6 +310,33 @@ def pause() -> dict[str, Any]:
     return {"status": "paused", "at": _now()}
 
 
+def _observed_window_seconds(snaps: list[dict[str, Any]]) -> float:
+    """How long this agent has actually been sampling. 0 with fewer than two."""
+    if len(snaps) < 2:
+        return 0.0
+    return max(0.0, float(snaps[-1]["ts"]) - float(snaps[0]["ts"]))
+
+
+def _apr_pct(fees_window_usdt: float, window_seconds: float, tvl: float) -> float | None:
+    """Fee APR annualised from the observed window.
+
+    ``None`` rather than 0.0 when it cannot be computed — a yield figure of
+    "0%" and "not enough data yet" are different claims, and only one of them
+    is honest on a position the agent has watched for two days.
+
+    Annualising a short window magnifies its noise: a single busy hour
+    extrapolates to a wild yearly rate. Callers get ``apr_window_seconds`` so
+    they can say how thin the basis is instead of quoting the number bare.
+    """
+    if window_seconds <= 0 or tvl <= 0:
+        return None
+    return (fees_window_usdt / tvl) * (SECONDS_PER_YEAR / window_seconds) * 100.0
+
+
+SECONDS_PER_YEAR = 365 * 86400
+THIRTY_DAYS = 30 * 86400
+
+
 def get_status() -> dict[str, Any]:
     """Marketplace status payload (spec 4.6)."""
     state = load_state()
@@ -328,9 +355,17 @@ def get_status() -> dict[str, Any]:
     f_usdt, f_bnb = fees_earned(state, fees)
     earned = _to_usdt(f_usdt, f_bnb, price)
     gas_usdt = state["gas_spent_wei"] / 1e18 * price
-    fees_24h, complete_24h = _fees_since(
-        state.get("snapshots") or [], 86400, f_usdt, f_bnb, price
-    )
+    snaps = state.get("snapshots") or []
+    fees_24h, complete_24h = _fees_since(snaps, 86400, f_usdt, f_bnb, price)
+
+    # spec 17/18 card fields. Both are windowed, and both ship the flag that
+    # says whether the window is real — the agent has been watching for days,
+    # not months, so an unqualified "APR" or "30D PnL" would be a fabrication
+    # dressed as a metric (the same fault as B14's fees_24h).
+    fees_30d, complete_30d = _fees_since(snaps, THIRTY_DAYS, f_usdt, f_bnb, price)
+    observed = _observed_window_seconds(snaps)
+    apr = _apr_pct(_fees_since(snaps, observed, f_usdt, f_bnb, price)[0] if observed else 0.0,
+                   observed, tvl)
     return {
         "agent": "BNB LP Rebalancer",
         "category": "rebalancing",
@@ -361,6 +396,12 @@ def get_status() -> dict[str, Any]:
         "fees_total": earned,
         "pnl": earned - gas_usdt,
         "gas_cost": gas_usdt,
+        # spec 17/18. `apr` is None when the basis is too thin to annualise —
+        # "0%" and "not enough data" are different claims about a yield.
+        "apr": apr,
+        "apr_window_seconds": observed,
+        "pnl_30d": fees_30d - gas_usdt if complete_30d else None,
+        "pnl_30d_window_complete": complete_30d,
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],
         # Beyond spec 4.6, and the only evidence a monitor pass actually
@@ -412,6 +453,17 @@ def get_status_report() -> str:
         f"  fees (total)       : {money(s['fees_total'])}",
         f"  gas spent          : {money(s['gas_cost'])}",
         f"  net PnL            : {money(s['pnl'])}",
+        # spec 17/18. Stated as unavailable rather than as a number when the
+        # window is too thin — a paid report must not imply a yield history the
+        # agent has not observed.
+        f"  fee APR            : " + (
+            f"{s['apr']:.2f}% (annualised from "
+            f"{s['apr_window_seconds'] / 3600:.1f}h of samples)"
+            if s.get("apr") is not None else
+            "not enough samples yet to annualise"),
+        f"  30D PnL            : " + (
+            money(s["pnl_30d"]) if s.get("pnl_30d") is not None else
+            "unavailable - watched for less than 30 days"),
         f"  rebalances         : {s['rebalance_count']} "
         f"(last: {s['last_rebalance'] or 'never'})",
     ])
@@ -442,9 +494,17 @@ def get_performance() -> dict[str, Any]:
     f_usdt, f_bnb = fees_earned(state, pending)
     earned = _to_usdt(f_usdt, f_bnb, price)
     gas_usdt = state["gas_spent_wei"] / 1e18 * price
-    fees_24h, complete_24h = _fees_since(
-        state.get("snapshots") or [], 86400, f_usdt, f_bnb, price
-    )
+    snaps = state.get("snapshots") or []
+    fees_24h, complete_24h = _fees_since(snaps, 86400, f_usdt, f_bnb, price)
+
+    # spec 17/18 card fields. Both are windowed, and both ship the flag that
+    # says whether the window is real — the agent has been watching for days,
+    # not months, so an unqualified "APR" or "30D PnL" would be a fabrication
+    # dressed as a metric (the same fault as B14's fees_24h).
+    fees_30d, complete_30d = _fees_since(snaps, THIRTY_DAYS, f_usdt, f_bnb, price)
+    observed = _observed_window_seconds(snaps)
+    apr = _apr_pct(_fees_since(snaps, observed, f_usdt, f_bnb, price)[0] if observed else 0.0,
+                   observed, tvl)
     return {
         "rebalance_count": state["rebalance_count"],
         "last_rebalance": state["last_rebalance"],

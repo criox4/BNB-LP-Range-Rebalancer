@@ -300,6 +300,64 @@ def _ping_status():
 # request bodies. This is a tiny pure-ASGI wrapper (no SDK edit) that rewrites the
 # response body only for JSON-RPC error payloads; every other response passes
 # through untouched.
+def _mount_deliverable_route(app) -> None:
+    """Serve the deliverable at the URL ``submit`` already published on-chain.
+
+    B23. ``submit_result`` uploads the manifest to local storage, then publishes
+    ``{ERC8183_AGENT_URL}/job/{id}/response`` on-chain because a ``file://`` URL
+    is not fetchable by a buyer. But ``serve_a2a`` mounts only the card, /ping
+    and JSON-RPC — nothing serves that path, so the seller 404'd its own
+    advertised URL and a buyer who had paid could not collect. The manifest was
+    on disk the whole time; only the route was missing.
+
+    The prefix comes from ``ERC8183_AGENT_URL`` so the route and the published
+    URL cannot drift apart — they are derived from one value.
+
+    Public by design: the URL is published on-chain, and the manifest is what
+    the buyer paid for. It carries no key material.
+    """
+    import json as _json
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    log = logging.getLogger("seller-agent")
+    agent_url = os.environ.get("ERC8183_AGENT_URL")
+    if not agent_url:
+        log.warning(
+            "ERC8183_AGENT_URL unset — not mounting the deliverable route. "
+            "submit will then publish a file:// URL no buyer can fetch."
+        )
+        return
+
+    prefix = urlparse(agent_url).path.rstrip("/")
+    # Same default the SDK's LocalStorageProvider.from_env uses.
+    store = Path(os.environ.get("STORAGE_LOCAL_PATH") or ".agent-data")
+
+    async def _deliverable(request):
+        try:
+            # int() is also the path-traversal guard: the id is the filename.
+            job_id = int(request.path_params["job_id"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "job_id must be an integer"}, status_code=400)
+        path = store / f"erc8183-job-{job_id}.json"
+        if not path.exists():
+            return JSONResponse(
+                {"error": f"no deliverable stored for job {job_id}",
+                 "hint": "this seller only serves jobs it submitted itself"},
+                status_code=404,
+            )
+        return JSONResponse(_json.loads(path.read_text()))
+
+    app.router.routes.append(
+        Route(f"{prefix}/job/{{job_id}}/response", _deliverable, methods=["GET"])
+    )
+    log.info("deliverable route mounted at %s/job/{job_id}/response (store=%s)",
+             prefix, store.resolve())
+
+
 def _strip_error_input(app):
     async def _wrapped(scope, receive, send):
         if scope["type"] != "http":
@@ -372,6 +430,9 @@ if __name__ == "__main__":
     # identical to serve_a2a — we only interpose the error-input stripper before
     # serving.
     app = build_a2a_app(executor, agent_card, ping_handler=_ping_status)
+    # Before the wrapper: _strip_error_input returns a bare ASGI callable with
+    # no router to append to.
+    _mount_deliverable_route(app)
     app = _strip_error_input(app)
 
     uvicorn.run(

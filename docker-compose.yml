@@ -14,11 +14,15 @@
 # MIGRATING AN EXISTING AGENT: a fresh volume starts with EMPTY state, which
 # reads as a brand-new agent — rebalance_count 0, no history, PnL and gas
 # accounting reset to zero while the on-chain position is unchanged. Copy the
-# state file across before first start, and chown it to the container user:
+# state across before first start, and chown it to the container user:
 #
-#   docker cp bnbLpRangeRebalancer/app/agent/.lp_state.<network>.json \
+#   docker cp bnbLpRangeRebalancer/app/agent/lp_state.<network>.db \
 #             bnb-lp-service:/data/state/
-#   docker exec -u root bnb-lp-service chown 10001:10001 /data/state/.lp_state.<network>.json
+#   docker exec -u root bnb-lp-service chown 10001:10001 /data/state/lp_state.<network>.db
+#
+# Copying the legacy .lp_state.<network>.json instead also works — the agent
+# imports it into SQLite on first open, once, guarded on the DB being empty.
+# Copy the .db for an agent that has already migrated; it is the live record.
 #
 # Same applies to ~/.bag/deliverables/app/*.json → /data/deliverables, or every
 # already-paid job's deliverable_url starts 404ing (B23).

@@ -31,6 +31,7 @@ from web3 import Web3
 
 import lp_signing as lp
 import blockchain as pcs
+import state_store
 import risk
 
 log = logging.getLogger("seller-agent.strategy")
@@ -70,7 +71,8 @@ def agent_id() -> str:
 # BOOTSTRAP token_id in studio.toml, i.e. manage whichever NFT a past rebalance
 # already emptied. Point this at a mounted volume there.
 STATE_DIR = Path(os.environ.get("LP_STATE_DIR") or Path(__file__).parent)
-STATE_PATH = STATE_DIR / f".lp_state.{NETWORK}.json"
+STATE_PATH = STATE_DIR / f".lp_state.{NETWORK}.json"   # legacy; migrated once
+DB_PATH = STATE_DIR / f"lp_state.{NETWORK}.db"
 POLL_SECONDS = 60
 
 
@@ -79,8 +81,10 @@ def _now() -> str:
 
 
 # --- Persistent state ----------------------------------------------------------
-# Small JSON file. ponytail: a file is enough for one position on one runtime;
-# move to real storage if this ever manages several.
+# SQLite (state_store.py). Was a whole-file JSON rewrite; it was replaced because
+# writes were non-atomic on a 60s path — a truncated file reads as "start fresh",
+# which resets token_id to the studio.toml bootstrap and points the agent at a
+# position a past rebalance already emptied (B10).
 _DEFAULT_STATE: dict[str, Any] = {
     "status": "paused",          # active | paused
     "token_id": None,
@@ -91,18 +95,35 @@ _DEFAULT_STATE: dict[str, Any] = {
     "fees_collected_usdt": 0.0,
     "fees_collected_bnb": 0.0,
     "history": [],
+    "snapshots": [],
 }
 _lock = threading.Lock()
 
 
-def load_state() -> dict[str, Any]:
-    state = dict(_DEFAULT_STATE)
+@lru_cache(maxsize=1)
+def _store() -> state_store.StateStore:
+    """The SQLite store, created on first use and migrated from JSON once.
+
+    Legacy `.lp_state.<network>.json` beside the database is imported on the
+    first open (guarded on the DB being empty, so it cannot double-import).
+    The old file is left in place, untouched, as a manual rollback path.
+    """
+    store = state_store.StateStore(DB_PATH, _DEFAULT_STATE)
     try:
-        state.update(json.loads(STATE_PATH.read_text()))
-    except FileNotFoundError:
-        pass
-    except Exception as e:  # noqa: BLE001 — corrupt state must not brick the agent
-        log.warning("state unreadable (%s); starting fresh", e)
+        if store.migrate_from_json(STATE_PATH):
+            log.info("migrated legacy state %s -> %s", STATE_PATH.name, DB_PATH.name)
+    except (OSError, ValueError) as e:
+        # Refusing here is the point: importing nothing would silently reset
+        # token_id to the studio.toml bootstrap value (B10).
+        raise RuntimeError(
+            f"legacy state {STATE_PATH} exists but is unreadable ({e}); refusing "
+            f"to start with empty state — fix or move the file, then restart"
+        ) from e
+    return store
+
+
+def load_state() -> dict[str, Any]:
+    state = _store().load()
     if state.get("token_id") is None:
         try:
             state["token_id"] = pcs.managed_token_id()
@@ -111,16 +132,16 @@ def load_state() -> dict[str, Any]:
     return state
 
 
-def save_state(state: dict[str, Any]) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
-
-
 def _update(**fields) -> dict[str, Any]:
+    """Set scalar fields. Append-only lists go through the store's own helpers.
+
+    The in-process lock stays: it makes read-modify-write of the SAME field
+    (``rebalance_count + 1``) atomic between this process's threads. SQLite's
+    transaction covers the write, not the read that computed the value.
+    """
     with _lock:
-        state = load_state()
-        state.update(fields)
-        save_state(state)
-        return state
+        _store().update(**fields)
+        return load_state()
 
 
 def current_token_id() -> int:
@@ -199,22 +220,28 @@ def fees_earned_usdt(state: dict[str, Any], pending: dict[str, Any], price: floa
     return _to_usdt(*fees_earned(state, pending), price)
 
 
-def _record_snapshot(state: dict[str, Any], fees_usdt: float, fees_bnb: float,
-                     tvl_usdt: float, price: float) -> list[dict[str, Any]]:
+def _record_snapshot(fees_usdt: float, fees_bnb: float,
+                     tvl_usdt: float, price: float) -> None:
     """Append a fee/TVL sample, rate-limited and bounded.
 
     Both fee token amounts are stored. Storing only their combined USDT value
     (what this did originally) made the 24h window unusable: differencing two
     values taken at different BNB prices books the revaluation of the ENTIRE
     historical BNB fee balance as fees earned in the window.
+
+    One INSERT + a bounded DELETE, in one transaction. Previously this returned
+    the whole capped list to be written back, so a 60s tick rewrote up to 500
+    samples to record one.
     """
-    snaps = list(state.get("snapshots") or [])
     now = time.time()
-    if snaps and (now - float(snaps[-1]["ts"])) < SNAPSHOT_MIN_GAP_SECONDS:
-        return snaps
-    snaps.append({"ts": now, "at": _now(), "fees_usdt": fees_usdt,
-                  "fees_bnb": fees_bnb, "tvl_usdt": tvl_usdt, "price": price})
-    return snaps[-SNAPSHOT_KEEP:]
+    last = _store().last_snapshot_ts()
+    if last is not None and (now - last) < SNAPSHOT_MIN_GAP_SECONDS:
+        return
+    _store().append_snapshot(
+        {"ts": now, "at": _now(), "fees_usdt": fees_usdt,
+         "fees_bnb": fees_bnb, "tvl_usdt": tvl_usdt, "price": price},
+        keep=SNAPSHOT_KEEP,
+    )
 
 
 def _fees_since(snaps: list[dict[str, Any]], seconds: float, current_usdt: float,
@@ -258,12 +285,9 @@ def check() -> dict[str, Any]:
         value = pcs.get_position_value(token_id, NETWORK)
         state = load_state()
         f_usdt, f_bnb = fees_earned(state, summary["pending_fees"])
-        _update(
-            last_check=_now(),
-            snapshots=_record_snapshot(
-                state, f_usdt, f_bnb, value.get("tvl_usdt", 0.0), summary["current_price"]
-            ),
-        )
+        _record_snapshot(f_usdt, f_bnb, value.get("tvl_usdt", 0.0),
+                         summary["current_price"])
+        _update(last_check=_now())
     except Exception as e:  # noqa: BLE001 — accounting must not break monitoring
         log.warning("snapshot failed: %s", e)
         _update(last_check=_now())
@@ -583,8 +607,8 @@ def _do_rebalance(token_id: int, summary: dict[str, Any], get_wallet) -> dict[st
         gas_spent_wei=state["gas_spent_wei"] + gas,
         fees_collected_usdt=state["fees_collected_usdt"] + collected.get("fees_usdt", 0.0),
         fees_collected_bnb=state["fees_collected_bnb"] + collected.get("fees_bnb", 0.0),
-        history=[*state["history"], entry],
     )
+    _store().append_history(entry)
     _persist_token_id(new_id)
 
     return {"rebalanced": True, "old_token_id": token_id, "new_token_id": new_id,

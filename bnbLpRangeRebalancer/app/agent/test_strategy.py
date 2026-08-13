@@ -10,6 +10,7 @@ found in the first place.
 from __future__ import annotations
 
 import multiprocessing
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -57,14 +58,89 @@ def test_fees_since_skips_legacy_snapshots():
     assert (earned, complete) == (0.0, False)
 
 
+def _isolated_store(tmp: Path):
+    """Point strategy at a throwaway SQLite store (never the real one)."""
+    import state_store
+    s.DB_PATH = tmp / "lp_state.test.db"
+    s.STATE_PATH = tmp / ".lp_state.test.json"
+    s._store.cache_clear()
+    return s._store()
+
+
 def test_record_snapshot_keeps_both_sides():
-    snaps = s._record_snapshot({}, 1.5, 0.02, 100.0, 600.0)
-    assert snaps[-1]["fees_usdt"] == 1.5 and snaps[-1]["fees_bnb"] == 0.02
+    with tempfile.TemporaryDirectory() as d:
+        _isolated_store(Path(d))
+        s._record_snapshot(1.5, 0.02, 100.0, 600.0)
+        snaps = s.load_state()["snapshots"]
+        assert snaps[-1]["fees_usdt"] == 1.5 and snaps[-1]["fees_bnb"] == 0.02
 
 
 def test_record_snapshot_rate_limited():
-    state = {"snapshots": [{"ts": time.time(), "fees_usdt": 0.0, "fees_bnb": 0.0}]}
-    assert len(s._record_snapshot(state, 1.0, 0.0, 1.0, 600.0)) == 1
+    """Two samples inside the gap must record ONE row, not two."""
+    with tempfile.TemporaryDirectory() as d:
+        _isolated_store(Path(d))
+        s._record_snapshot(1.0, 0.0, 1.0, 600.0)
+        s._record_snapshot(2.0, 0.0, 1.0, 600.0)
+        assert len(s.load_state()["snapshots"]) == 1
+
+
+def test_state_writes_are_atomic_and_appends_are_o1():
+    """The two faults that motivated leaving JSON behind.
+
+    A truncated write used to read as "start fresh", which silently reset
+    token_id to the studio.toml bootstrap (B10). And history/snapshots were
+    rewritten in full on a 60s path.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = _isolated_store(Path(d))
+        s._update(status="active", token_id=7116214)
+        for i in range(5):
+            store.append_history({"at": f"t{i}", "action": "rebalance"})
+        state = s.load_state()
+        assert state["status"] == "active" and state["token_id"] == 7116214
+        assert [h["at"] for h in state["history"]] == [f"t{i}" for i in range(5)]
+
+        # update() must refuse a whole-list write — that is the regression the
+        # append tables exist to prevent.
+        try:
+            store.update(history=[{"at": "clobber"}])
+            raise AssertionError("update() accepted a whole-list history write")
+        except TypeError as e:
+            assert "append-only" in str(e), e
+
+
+def test_legacy_json_is_migrated_exactly_once():
+    """The mainnet history must survive the move, and never double-import."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        legacy = tmp / ".lp_state.test.json"
+        legacy.write_text(json.dumps({
+            "status": "paused", "token_id": 7116214, "rebalance_count": 1,
+            "gas_spent_wei": 31857000000000,
+            "history": [{"at": "2026-08-11T16:15:32+00:00", "action": "rebalance"}],
+            "snapshots": [{"ts": 1.0, "fees_usdt": 0.5, "fees_bnb": 0.001}],
+        }))
+        _isolated_store(tmp)
+        state = s.load_state()
+        assert state["token_id"] == 7116214 and state["rebalance_count"] == 1
+        assert len(state["history"]) == 1 and len(state["snapshots"]) == 1
+
+        # Re-opening must not duplicate: the guard is "DB is empty", not
+        # "file is absent", so the legacy file staying put is safe.
+        s._store.cache_clear()
+        assert len(s._store().load()["history"]) == 1
+
+
+def test_corrupt_legacy_json_refuses_rather_than_starting_fresh():
+    """B10: silently starting fresh resets token_id to the toml bootstrap."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        (tmp / ".lp_state.test.json").write_text('{"status": "paused", trunc')
+        try:
+            _isolated_store(tmp)
+            raise AssertionError("accepted a corrupt legacy state file")
+        except (RuntimeError, ValueError) as e:
+            assert "unreadable" in str(e).lower() or "expecting" in str(e).lower(), e
 
 
 # --- studio.toml rewriting must stay inside [strategy] -------------------------

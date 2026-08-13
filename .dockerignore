@@ -1,0 +1,21 @@
+# SECRETS — these must never enter a build context, let alone a layer.
+# .studio/ holds the encrypted keystore and .env.local; a COPY of the repo
+# root would otherwise bake the signing key into a shareable image.
+**/.studio/
+**/.env
+**/.env.local
+**/*.pem
+**/*.key
+
+# Local state that must come from a volume, not a layer: baking it in would
+# ship one machine's rebalance history and locks to every container.
+**/.agent-data/
+**/lp_state*.json
+
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+.git/
+**/wheels/
+bnbLpRangeRebalancer/agentcore/cdk/

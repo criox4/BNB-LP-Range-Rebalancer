@@ -1,0 +1,77 @@
+# VPS deployment: the two spec-2 layers as two processes from one image.
+#
+#   docker compose up -d --build
+#
+# Required on the host (never in this file, never in the image):
+#   WALLET_PASSWORD   unlocks the keystore — the sole signer
+#   OPENROUTER_API_KEY
+#   SERVICE_API_KEY   gates /activate /pause /execute; unset => they 503
+#   PUBLIC_URL        where THIS host is reachable, e.g. https://agent.example.com
+#
+# Easiest: keep them in .studio/.env.local (already gitignored) and start with
+#   set -a && . bnbLpRangeRebalancer/.studio/.env.local && set +a && docker compose up -d
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: bnb-lp-rebalancer:latest
+  restart: unless-stopped
+  environment: &common-env
+    BNB_NETWORK: ${BNB_NETWORK:-bsc-mainnet}
+    WALLET_PASSWORD: ${WALLET_PASSWORD:?set WALLET_PASSWORD on the host}
+    OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY on the host}
+  volumes:
+    # The keystore, read-only. Outside the image on purpose (studio commitment
+    # 2: keys stay in a user-controlled environment).
+    - ./bnbLpRangeRebalancer/.studio/wallets:/secrets/wallets:ro
+    # State + deliverables must outlive any container (B10, B23).
+    - agent-data:/data
+
+services:
+  # The seller: A2A negotiate / notify_funded, holds the key, signs.
+  agent:
+    <<: *common
+    container_name: bnb-lp-agent
+    command: python /app/bnbLpRangeRebalancer/app/agent/main.py
+    working_dir: /app/bnbLpRangeRebalancer/app/agent
+    environment:
+      <<: *common-env
+      # Must be the PUBLIC URL: submit publishes {this}/job/{id}/response
+      # on-chain, and a buyer on another machine has to fetch it. Pointing this
+      # at localhost is what made job 56588's deliverable unreachable (B23).
+      ERC8183_AGENT_URL: ${PUBLIC_URL:?set PUBLIC_URL}/erc8183
+      # The monitor runs in the service, not here. Exactly one, never both.
+      AGENT_RUN_MONITOR: "0"
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  # The public REST surface. Holds no key; runs the monitor loop.
+  service:
+    <<: *common
+    container_name: bnb-lp-service
+    command: python /app/bnbLpRangeRebalancer/app/service/main.py
+    working_dir: /app/bnbLpRangeRebalancer/app/service
+    environment:
+      <<: *common-env
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY on the host}
+      # This container owns the 60s poll. An flock cannot span hosts, so if you
+      # ever run a second VPS, exactly one of them sets this (spec 11).
+      SERVICE_RUN_MONITOR: "1"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  agent-data:

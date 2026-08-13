@@ -271,11 +271,44 @@ and `PUBLIC_URL`. The keystore is **never baked in** — `.dockerignore` exclude
 `.studio/`, and the wallets directory is bind-mounted read-only at
 `/secrets/wallets`.
 
+The container runs as uid **10001**, so the keystore must be readable by that
+uid on the host:
+
+```bash
+chown -R 10001:10001 bnbLpRangeRebalancer/.studio/wallets
+chmod 700 bnbLpRangeRebalancer/.studio/wallets
+chmod 600 bnbLpRangeRebalancer/.studio/wallets/*.json
+```
+
+A `600 root:root` keystore looks correct and boots fine — the agent only fails
+at the first signature, as a `PermissionError` surfaced through the A2A error
+channel. macOS Docker hides this by remapping ownership; a Linux VPS does not.
+
+Ports are published on **loopback only**. Docker writes its own iptables rules,
+consulted ahead of ufw's, so a `0.0.0.0` publish is world-reachable on a
+deny-by-default host while `ufw status` still reports the port blocked. Put a
+reverse proxy in front — `deploy/nginx/bnb-lp-rebalancer.conf` is a working
+two-host site — or set `BIND_ADDR=0.0.0.0` deliberately.
+
 State, deliverables and the signing audit log share one named volume at `/data`.
 That is not tidiness: a fresh volume reads as a brand-new agent (counters at
 zero, no history) while the on-chain position is unchanged, and losing the
 deliverables directory 404s every already-paid job's `deliverable_url` forever.
 `docker-compose.yml` documents the migration copy.
+
+## Live Deployment
+
+| | |
+|---|---|
+| Agent (A2A seller) | https://bnb-lp.172-104-171-139.nip.io |
+| Agent card | https://bnb-lp.172-104-171-139.nip.io/.well-known/agent-card.json |
+| Service (REST) | https://bnb-lp-api.172-104-171-139.nip.io |
+| Health | https://bnb-lp-api.172-104-171-139.nip.io/health |
+
+TLS via Let's Encrypt, both hostnames on one certificate, auto-renewing.
+`ERC8183_AGENT_URL` is `https://bnb-lp.172-104-171-139.nip.io/erc8183` — the
+origin published on-chain by `submit_result`, so it must not change while any
+submitted job is unsettled.
 
 ## ERC-8004
 

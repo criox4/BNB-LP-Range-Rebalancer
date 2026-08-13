@@ -20,7 +20,7 @@ is verified on-chain, and what remains. Spec reference throughout is
 | **Mainnet position** | **`7116214`** (rebalanced from `7116193`), live, in range |
 | Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
 | **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
-| ERC-8004 testnet | `agent_id 1796` — agentURI frozen as `fxagent`; correct name in metadata |
+| ERC-8004 testnet | `agent_id 1796` — agentURI **rewritten** to `BNB LP Range Rebalancer (Testnet)` (§4.12: registrations are mutable) |
 | Monitor loop | 60s poll; **opt-in** via `$AGENT_RUN_MONITOR` or `$SERVICE_RUN_MONITOR` — exactly one, never two hosts (§11) |
 | Active network | selected by **`$BNB_NETWORK`** (§7), falling back to `[network].default`. Mainnet position `7116214` is untouched and paused |
 | Runtime state | **paused** (will not trade unattended) |
@@ -89,7 +89,7 @@ remaining project.
 | §3.1 | LLM must never generate arbitrary calldata | **done** | §4.1 below; enforced + tested |
 | §8 | REST: `/health` `/status` `/strategy` `/performance` `/positions` `/transactions`, `POST /activate` `/pause` `/execute` | **done** | `app/service/api.py`; control routes gated by `$SERVICE_API_KEY`, fail closed |
 | §9 | Shared agent metadata JSON | **done** | `GET /metadata` |
-| §10 | ERC-8004 identity | **done** | mainnet `265375`, testnet `1796`; both on the throwaway wallet with a frozen `localhost` endpoint — §4.12, gap G3 |
+| §10 | ERC-8004 identity | **done** | mainnet `265375`, testnet `1796`; both on the throwaway wallet, endpoints still `localhost` but **editable on-chain** — §4.12, gap G3 |
 | §11 | ERC-8183 service integration | **partial** | `negotiate` verified (signed quote, chain 97); `notify_funded` blocked — buyer path reverts `PolicyNotWhitelisted()`, gap G4 |
 | §12 | Testnet for dev, mainnet for production | **done** | both exercised; `[network].default` switches |
 | §13 | Shared `config/bsc-contracts.json`, no hardcoded addresses | **done** | `blockchain._addresses` loads it; pool chosen by fee tier |
@@ -291,37 +291,51 @@ share* of the shallower fee-500 pool (2.1×) at a 5× higher fee rate — roughl
 10× the fee income per unit of volume. For a $1 position where the goal is
 observing fees at all, fee-500 wins. Recorded in `ADDRESSES` with the tradeoff.
 
-### 4.12 An ERC-8004 registration is immutable — register *last*
+### 4.12 An ERC-8004 registration IS mutable — this section was wrong
+
+**Corrected 2026-08-13.** This section previously claimed the registration was
+immutable and that a production identity therefore had to be registered *last*,
+after a public URL existed. That was wrong, and it was wrong in the expensive
+direction: it made a fixable mistake look permanent.
+
 `bag erc8004 register` mints an `agentURI` of the form
-`data:application/json;base64,…`. That is not a pointer to a document; the name,
-description and `services[].endpoint` **are** the document, embedded on-chain.
+`data:application/json;base64,…`, so name, description and
+`services[].endpoint` are embedded rather than pointed at. But the registry
+exposes an on-chain `setAgentURI`, and the SDK wraps it twice:
 
-The consequence is stronger than "the name is fixed". `bag erc8004
-update-endpoint` succeeded on both networks — a confirmed receipt, 158k gas, two
-logs — and the agentURI did not change. The endpoint is as frozen as the name.
-`update-metadata` *does* write, and reads back through `get-metadata`, which is
-why the testnet record now carries the correct name there even though its
-agentURI still says `fxagent`. (`bag erc8004 show` prints `metadata: {}`
-regardless; it does not enumerate keys.)
+* `update_service_endpoint(wallet, endpoint)` (CLI: `bag erc8004
+  update-endpoint`) — decodes the current `data:` URI, patches
+  `services[].endpoint`, re-encodes, writes. Preserves everything else.
+* `update_endpoint(wallet, new_uri)` (library) — replaces the **whole** URI,
+  so name and description move too.
 
-This was found the expensive way: both registrations were made with the endpoint
-set to the agent-card path rather than the A2A base URL, which made the buyer's
-`--agent-id` resolution 404 on `…/agent-card.json/negotiate`. That mistake is now
-permanent on both chains.
+Verified on testnet agent `1796`: `0x8750df07…` rewrote name, description and
+endpoint together (`fxagent` → `BNB LP Range Rebalancer`, endpoint →
+`https://example.invalid/…`), read back from chain; `0x72a11909…` then restored
+a correct record. Nothing is frozen.
 
-Two things follow, and they invert the plan this session started with:
+Why the original conclusion looked confirmed: `update-endpoint` was called with
+the endpoint it already had. The SDK appends `/.well-known/agent-card.json` to
+an A2A base URL, so passing the base URL produced a byte-identical document —
+a confirmed receipt, real gas, and no visible change. That reads exactly like a
+no-op setter. **A test whose input equals the current state cannot detect
+mutability**, and one 158k-gas receipt was treated as proof for both chains.
 
-1. **Order.** A production identity must be registered *after* the public URL
-   exists, not before — the deploy is a prerequisite of registration, not a
-   follow-up to it.
-2. **Escape hatch.** `register --agent-uri` accepts a pre-built URI. Passing an
-   `https://` URL instead of a `data:` blob makes the identity document mutable
-   off-chain, which is the only way to keep a registration correctable.
+The endpoint form was also not a mistake: for A2A the on-chain endpoint IS the
+agent-card discovery URL, which the SDK builds. `--agent-id` resolution fails
+for a different reason — the document advertises A2A only and no ERC8183
+service, so a buyer finds no ERC-8183 endpoint to negotiate against.
 
-The mainnet identity is therefore named `BNB LP Rebalancer (Test)` on purpose.
-It proves the §22 ERC-8004 row on a wallet that is already compromised and was
-never going to be the deploy wallet; the real one gets registered once, later,
-against a real URL.
+What actually follows:
+
+1. **Order is a preference, not a constraint.** Registering before a public URL
+   exists is fine; point the endpoint at the real URL afterwards. Registration
+   is no longer a one-shot.
+2. Mainnet `265375` still says `BNB LP Rebalancer (Test)` and `localhost` — both
+   now fixable, and worth fixing once the deploy has a real URL rather than
+   burning gas on an interim value.
+3. `register --agent-uri` with an `https://` URL is still the cheapest way to
+   keep the document editable **off-chain**, i.e. without a transaction per edit.
 
 ### 4.13 ERC-8183 buying is broken on testnet, not in our code
 
@@ -640,7 +654,7 @@ on something external.
 | ID | Gap | Blocked by |
 |---|---|---|
 | **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. Acceptable while the wallet holds $0.81 of a throwaway position; not acceptable before real value | a decision |
-| **G3** | §10 ERC-8004 **production** identity. Both networks are now registered, but on the compromised wallet and with a `localhost` endpoint frozen into the agentURI (see §4.12). The mainnet record is deliberately named `BNB LP Rebalancer (Test)` | a fresh wallet (G13) **and** a public URL (G10) — register last, not first |
+| **G3** | §10 ERC-8004 **production** identity. Both networks are registered on the compromised wallet with `localhost` endpoints. Name/description/endpoint are all rewritable on-chain (§4.12), so this is now a `setAgentURI` call once a public URL exists — not a re-registration. The wallet is the only part that cannot be edited | a fresh wallet (G13) for the *owner*; a public URL (G10) for the endpoint |
 | **G14** | Settle job `56587` (`approve` → `COMPLETED`). Calling it early reverts `0x17be5b7b` | the 24h dispute window |
 | **G15** | `deliverable_url` is fetchable now (B23 fixed) but points at **`localhost`**, and `[storage].kind = "local"` keeps the manifest on one machine's disk. Fine for a local buyer; a remote one needs a public URL, and surviving a redeploy needs IPFS | G9/G10 |
 | **G7** | §17/§18 card fields APR and 30D PnL | elapsed time — the agent has been watching under 24h |

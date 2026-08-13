@@ -349,7 +349,22 @@ def _mount_deliverable_route(app) -> None:
                  "hint": "this seller only serves jobs it submitted itself"},
                 status_code=404,
             )
-        return JSONResponse(_json.loads(path.read_text()))
+        # A manifest that exists but cannot be read is a DIFFERENT failure from
+        # one that was never written, and the buyer has already paid for it —
+        # so say which. Restoring a deliverables volume from a backup with the
+        # wrong ownership produces exactly this, and an unhandled OSError here
+        # is a bare 500 with nothing to act on.
+        try:
+            return JSONResponse(_json.loads(path.read_text()))
+        except (OSError, ValueError) as e:
+            log.exception("deliverable for job %s is stored but unreadable", job_id)
+            return JSONResponse(
+                {"error": f"deliverable for job {job_id} is stored but unreadable",
+                 "detail": f"{type(e).__name__}: {e}",
+                 "hint": f"check ownership/permissions of {path.name} in the "
+                         f"deliverables store"},
+                status_code=500,
+            )
 
     app.router.routes.append(
         Route(f"{prefix}/job/{{job_id}}/response", _deliverable, methods=["GET"])

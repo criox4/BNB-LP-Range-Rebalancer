@@ -739,7 +739,8 @@ rebalance mints a new NFT.
 | agent, no flag | `LP monitor NOT started here` |
 | agent, `AGENT_RUN_MONITOR=1` | `monitor loop started (poll=60s)` |
 | service, `SERVICE_RUN_MONITOR=1` | started; `/health` → `monitor_running: true` |
-| **monitor on MAINNET** | 2026-08-13: three 60s passes against position `7116214` (`price=613.56 util=7.1% required=False`), `last_check` advancing over `/health` from a **second process**. Activated and paused through the gated routes; `/activate` returns 401 with no key and with a wrong key | |
+| **monitor on MAINNET** | 2026-08-13: two 60s passes while active against position `7116214` (`price=613.56 util=7.1% required=False`), `last_check` advancing 07:11:06 → 07:12:11 over `/health` from a **second process**. Activated and paused through the gated routes; `/activate` returns 401 with no key and with a wrong key | |
+| **pause semantics, observed** | after `/pause`, `monitor_running` stays `true` while `last_check` freezes at 07:12:11 across later samples — the loop is alive but performs no checks. So "paused" is NOT a state in which monitoring can be observed to work; proving the loop requires `active`, which is why the mainnet test needed real fund authority for its window | |
 | `LP_STATE_DIR` | state **and** lock relocate; network stays in the filename; the repo's own state file untouched |
 | guard test | fails on an ungated `start_monitor()` — confirmed against a simulated regression, not assumed |
 

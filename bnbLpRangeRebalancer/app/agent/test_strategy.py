@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import multiprocessing
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -246,6 +247,48 @@ def test_monitor_is_opt_in_on_both_halves():
         assert "start_monitor()" in src, f"{path} no longer starts the monitor at all"
         gate = src.split("start_monitor()")[0]
         assert flag in gate, f"{path} starts the monitor without checking ${flag}"
+
+
+def test_agent_card_url_prefers_the_public_origin() -> None:
+    """The card's `url` is what a buyer dials. A localhost value there is not a
+    broken card — it resolves fine and sends every buyer to its own machine.
+    Deployed once with PUBLIC_URL unhonored, so it is pinned here."""
+    import agent_card
+
+    saved = {k: os.environ.get(k) for k in
+             ("PUBLIC_URL", "ERC8183_AGENT_URL", "AGENTCORE_RUNTIME_URL")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        # No hints at all → local dev fallback, and nothing else.
+        assert agent_card._public_base_url() is None
+
+        # PUBLIC_URL wins, normalised to a trailing-slash origin: the A2A SDK
+        # appends .well-known/agent-card.json to whatever this returns.
+        os.environ["PUBLIC_URL"] = "https://agent.example.com"
+        assert agent_card._public_base_url() == "https://agent.example.com/"
+
+        # Derived from ERC8183_AGENT_URL when PUBLIC_URL is absent — same host
+        # as the deliverable URL published on-chain, path stripped.
+        os.environ.pop("PUBLIC_URL")
+        os.environ["ERC8183_AGENT_URL"] = "https://agent.example.com/erc8183"
+        assert agent_card._public_base_url() == "https://agent.example.com/"
+
+        # AgentCore owns its own address and outranks both.
+        os.environ["AGENTCORE_RUNTIME_URL"] = "https://runtime.aws/"
+        assert agent_card.build_agent_card().url == "https://runtime.aws/"
+
+        # A garbage value must not become a half-built URL.
+        os.environ.pop("AGENTCORE_RUNTIME_URL")
+        os.environ["ERC8183_AGENT_URL"] = "not-a-url"
+        assert agent_card._public_base_url() is None
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def main() -> None:

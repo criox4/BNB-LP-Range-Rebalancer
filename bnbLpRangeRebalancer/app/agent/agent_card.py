@@ -18,6 +18,7 @@ You own this file — edit the skill descriptions / card metadata for your selle
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 from a2a.types import (
     AgentCapabilities,
@@ -74,6 +75,32 @@ def _agent_name() -> str:
     return name or "bnbagent-seller"
 
 
+def _public_base_url() -> str | None:
+    """The public origin a buyer can reach this agent at, or None if unset.
+
+    Prefers ``PUBLIC_URL``. Falls back to deriving the origin from
+    ``ERC8183_AGENT_URL``, which a self-hosted deployment must set anyway —
+    ``submit_result`` publishes ``{ERC8183_AGENT_URL}/job/{id}/response``
+    on-chain, so that variable is already known-good and known-public. Deriving
+    from it means the card and the on-chain deliverable can never name two
+    different hosts, which is the failure that would be hardest to notice: both
+    halves work in isolation and only a buyer discovers they disagree.
+
+    Always returns an origin with a trailing slash and no path, because the A2A
+    SDK appends ``.well-known/agent-card.json`` to it.
+    """
+    explicit = (os.environ.get("PUBLIC_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/") + "/"
+    agent_url = (os.environ.get("ERC8183_AGENT_URL") or "").strip()
+    if not agent_url:
+        return None
+    parts = urlsplit(agent_url)
+    if not parts.scheme or not parts.netloc:
+        return None
+    return f"{parts.scheme}://{parts.netloc}/"
+
+
 def _oauth2_scheme() -> SecurityScheme | None:
     """OAuth2 (Cognito client-credentials) scheme from env, or None locally.
 
@@ -111,16 +138,26 @@ def build_agent_card() -> AgentCard:
     return AgentCard(
         name=name,
         description=f"ERC-8183 seller agent ({name}) — negotiate + notify_funded over A2A.",
-        # serve_a2a overwrites this with $AGENTCORE_RUNTIME_URL at runtime.
-        # Local-dev fallback: a client-routable localhost URL (not the 0.0.0.0
-        # bind address). Host via AGENT_HOST (default localhost); port via the
-        # same AGENT_PORT → 9000 resolution main.py serves on. Do not honor the
-        # AgentCore HTTP $PORT=8080 convention for this A2A runtime.
-        url=os.environ.get(
-            "AGENTCORE_RUNTIME_URL",
-            f"http://{os.environ.get('AGENT_HOST', 'localhost')}:"
-            f"{os.environ.get('AGENT_PORT') or '9000'}/",
-        ),
+        # Where a BUYER reaches this agent. Resolution order:
+        #
+        #   AGENTCORE_RUNTIME_URL — serve_a2a sets this when deployed to AWS
+        #                           AgentCore; it wins because the runtime owns
+        #                           its own address.
+        #   PUBLIC_URL            — a self-hosted deployment behind a reverse
+        #                           proxy. Neither of the other two apply there,
+        #                           and without this the card published a
+        #                           localhost URL to the public internet: the
+        #                           card resolved, and every buyer that followed
+        #                           it dialled its own machine.
+        #   localhost fallback    — local dev. Client-routable, not the 0.0.0.0
+        #                           bind address. Host via AGENT_HOST, port via
+        #                           the same AGENT_PORT → 9000 resolution
+        #                           main.py serves on. Do not honor the
+        #                           AgentCore HTTP $PORT=8080 convention here.
+        url=os.environ.get("AGENTCORE_RUNTIME_URL")
+        or _public_base_url()
+        or f"http://{os.environ.get('AGENT_HOST', 'localhost')}:"
+        f"{os.environ.get('AGENT_PORT') or '9000'}/",
         version="1.0.0",
         protocol_version="0.3.0",
         preferred_transport="JSONRPC",

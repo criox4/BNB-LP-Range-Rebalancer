@@ -17,6 +17,11 @@ the new price — then verifies the result on-chain before calling it done.
 It is live on **BSC mainnet** with real funds: position `7116214`, one completed
 rebalance, all transaction hashes below.
 
+It also **sells itself**. The same process runs an ERC-8183 seller over A2A: a
+buyer negotiates a signed quote, funds the job in $U, and gets a position report
+produced by the LLM from read-only chain state and submitted on-chain. Four paid
+jobs have run the full lifecycle on mainnet — see [ERC-8183](#erc-8183).
+
 The design constraint that shapes everything: **the LLM never signs and never
 produces calldata.** It can read chain state and explain what it sees. Whether
 to rebalance is decided by deterministic code; what calldata that means is
@@ -183,16 +188,17 @@ codeLocation, so no packaging path can bundle it.
 ## Local Development
 
 ```bash
+git clone https://github.com/criox4/BNB-LP-Range-Rebalancer.git
 uv venv && uv pip install -e bnbLpRangeRebalancer
 
 # commit hooks — once per clone. core.hooksPath is local config, so cloning
 # does NOT bring the hook with it; this line is what turns it on.
 git config core.hooksPath .githooks
 
-# tests — offline, no RPC, no wallet
+# tests — offline, no RPC, no wallet. 45 total.
 python bnbLpRangeRebalancer/app/agent/test_blockchain.py     # 20 range/tick/liquidity
-python bnbLpRangeRebalancer/app/agent/test_strategy.py       # 11 accounting/locking
-python bnbLpRangeRebalancer/app/agent/test_service.py        # REST routes + auth
+python bnbLpRangeRebalancer/app/agent/test_strategy.py       # 18 accounting/state/locking
+python bnbLpRangeRebalancer/app/agent/test_service.py        #  7 REST routes + auth
 
 # live read-only smoke against both chains
 python bnbLpRangeRebalancer/app/agent/test_blockchain.py --live
@@ -212,6 +218,14 @@ python bnbLpRangeRebalancer/app/service/main.py    # REST :8080
 
 Run the monitor loop in exactly one process. Both is safe — the cross-process
 lock refuses the second rebalance rather than duplicating it — but wasteful.
+
+Agent state (rebalance counters, fee/gas accounting, the snapshot series behind
+`fees_24h` and APR) lives in a **SQLite** database, `lp_state.<network>.db`,
+next to the agent. It replaced a JSON file that was rewritten whole on every
+update — a truncate-then-write that a crash mid-write could leave empty. Writes
+are now single transactions with `synchronous=FULL`. A legacy
+`.lp_state.<network>.json` is imported automatically on first open, once, and
+only into an empty database.
 
 Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org):
 `type(scope): description`, under 72 characters, from `feat fix docs style
@@ -240,15 +254,46 @@ Same flow with `[network].default = "bsc-mainnet"`, plus:
 
 Currently deployed against position `7116214`, strategy **paused**.
 
+## Docker
+
+One image, two entrypoints — the two §2 layers are separate processes, but they
+share a dependency set, so two Dockerfiles would only be two ways to drift. The
+build context is the **repo root**, because `blockchain.py` finds
+`config/bsc-contracts.json` by walking parent directories.
+
+```bash
+set -a && . bnbLpRangeRebalancer/.studio/.env.local && set +a
+docker compose up -d --build
+```
+
+The host must supply `WALLET_PASSWORD`, `OPENROUTER_API_KEY`, `SERVICE_API_KEY`
+and `PUBLIC_URL`. The keystore is **never baked in** — `.dockerignore` excludes
+`.studio/`, and the wallets directory is bind-mounted read-only at
+`/secrets/wallets`.
+
+State, deliverables and the signing audit log share one named volume at `/data`.
+That is not tidiness: a fresh volume reads as a brand-new agent (counters at
+zero, no history) while the on-chain position is unchanged, and losing the
+deliverables directory 404s every already-paid job's `deliverable_url` forever.
+`docker-compose.yml` documents the migration copy.
+
 ## ERC-8004
 
-Agent identity registered on BSC testnet, agent id `1796`.
+| Network | Agent id |
+|---|---|
+| BSC Mainnet | `265375` |
+| BSC Testnet | `1796` |
 
-**Known gap:** the registration was made with a wallet previously used for a
-different agent, so the on-chain identity's name and description read
-"fxagent". Name and description are baked into the agentURI at registration and
-only the endpoint and metadata are updatable — a correct identity needs a fresh
-wallet. Tracked in DOCUMENTATION.md.
+The identity document is **mutable**. `agentURI` is a
+`data:application/json;base64,…` blob, and `setAgentURI` replaces it wholesale —
+so name, description, skills and endpoint can all be corrected in place, on the
+same agent id, without re-registering. An earlier note here claimed otherwise;
+it was wrong, and proved wrong on testnet `1796`.
+
+**Open:** the mainnet identity still carries a development name and a
+`localhost` endpoint. Correcting it is one `setAgentURI` call, but it is worth
+spending once — against the real public URL, from the rotated wallet — so it
+waits on deployment.
 
 ## ERC-8183
 
@@ -256,16 +301,30 @@ The agent serves two ERC-8183 seller skills over A2A:
 
 - **`negotiate`** — reads the fixed list price from `studio.toml`, clamps it to
   `[min_price, max_price]`, and EIP-191 signs the offer. **No LLM touches
-  pricing.** Verified end-to-end: a call returns a signed, correctly
-  chain-scoped quote.
+  pricing.**
 - **`notify_funded`** — verifies the funded job on-chain, acks, then produces
   the deliverable in the background and submits it.
 
-`settle` is deliberately operator-driven: `bag erc8183 settle <job_id>`.
+`settle` is deliberately operator-driven: `bag erc8183 settle <job_id>`, after
+the contract's 24h dispute window.
 
-**Known gap:** `notify_funded` has not been exercised end-to-end, because that
-needs a buyer to fund a job in $U and the wallet holds none. The LLM work step
-itself is proven.
+**Proven on mainnet** — four paid jobs, real $U, full lifecycle (create →
+register → set_budget → fund → notify_funded → submit):
+
+| Job | Notes |
+|---|---|
+| `56587` | first end-to-end paid delivery |
+| `56588` | exposed B23 — the deliverable was published at a URL nothing served |
+| `56589` | first containerised run; its report carries a wrong TVL (B25) |
+| `56590` | all fixes proven at once — TVL, APR, 30D PnL, durable audit trail |
+
+Two lessons are baked into the code as a result. The buyer's `deliverable_url`
+must be **fetchable**: `submit_result` publishes `{ERC8183_AGENT_URL}/job/{id}/response`
+on-chain, so the agent now serves that route itself and `ERC8183_AGENT_URL` must
+be the public URL, not `localhost`. And the LLM must never be handed a raw V3
+liquidity integer — job `56589` reported "TVL: 335,389.79 BNB" for a position
+holding $0.81, because the number was in its context and looked like money.
+`tools.py` now replaces those integers with a self-describing string.
 
 ## API
 
@@ -329,10 +388,21 @@ Position `7116214`: range $548.22–$670.27, TVL ~$0.81, in range.
   PnL needs entry-price accounting.
 - **Fees earned before this agent took over are invisible** — chain state alone
   cannot attribute them.
+- **APR is annualized from a short window, and says so.** `apr` is `null` — not
+  `0.0` — when the observed window is too thin to annualize, because "0% yield"
+  and "not enough data" are different claims. `pnl_30d` is withheld entirely
+  until 30 days are genuinely observed.
 - **Single position, single pair, single fee tier** (§4.2, by design in v1).
-- **`notify_funded` unproven end-to-end** — see [ERC-8183](#erc-8183).
-- **ERC-8004 identity metadata is wrong** — see [ERC-8004](#erc-8004).
-- **Not yet deployed to AWS**; `[storage].kind = "local"` is not deployable and
-  needs IPFS. No public service URL yet (§19).
+- **One host only.** Concurrent buyers are fine — jobs run as independent tasks
+  with in-flight de-duplication — but the rebalance mutex is an `flock`, which
+  cannot span machines. A second VPS needs a shared lock, and exactly one host
+  may run the monitor.
+- **Per-user positions are not supported.** There is one agent-owned position;
+  buyers purchase reports on it, not their own managed liquidity.
+- **ERC-8004 mainnet identity still reads as development** — see
+  [ERC-8004](#erc-8004).
+- **No public URL yet**, so `deliverable_url` points at `localhost` and
+  `[storage].kind = "local"` means deliverables live on one disk. Durable
+  buyer-fetchable storage needs IPFS (§19).
 - **The wallet is a throwaway.** Its key was pasted in plaintext during
   development and must be rotated before this holds meaningful value.

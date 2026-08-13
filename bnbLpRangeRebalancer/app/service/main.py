@@ -38,6 +38,17 @@ AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
+# `bag dev` auto-loads .studio/.env.local for the Agent Layer; this process is
+# plain `python main.py`, so it did not — every run needed the variables
+# exported by hand, and a forgotten SERVICE_API_KEY silently 503s the control
+# routes. Same loader the SDK uses, so both halves read one file.
+# Real environment wins: an explicit `FOO=1 python main.py` must still override.
+from bnbagent_studio_core.config import env_local_path, load_env  # noqa: E402
+
+_ENV_FILE = env_local_path(AGENT_DIR)
+if _ENV_FILE.exists():
+    load_env(_ENV_FILE)
+
 
 def _configure_logging() -> None:
     log = logging.getLogger("seller-agent")

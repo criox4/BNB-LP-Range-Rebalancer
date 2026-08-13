@@ -51,6 +51,39 @@ def _managed(token_id: int | None) -> int:
     return int(token_id) if token_id else strat_token_id()
 
 
+# V3 liquidity is an integer in the pool's own units. It is NOT a token amount
+# and NOT a money value, but it is large and sits next to money figures, so a
+# model asked for "TVL" will scale it and report it as one. That is not
+# hypothetical twice over: it is B9, and it REGRESSED through this very file —
+# `get_position_summary` (added in B21) carries liquidity and NO tvl, so paid
+# job 56589 delivered "TVL: 335,389.79 BNB" for a position holding $0.81.
+#
+# Prompting did not hold: main.py already tells the model to quote
+# `get_status_report` verbatim and names this exact number as the failure.
+# So the fix is to stop handing over the material — the model cannot misread a
+# number it never sees. Deterministic code decides what the model is given, the
+# same principle spec 3.1 applies to calldata.
+_LIQUIDITY_KEYS = ("position_liquidity", "pool_active_liquidity", "liquidity_raw")
+
+
+def _hide_raw_liquidity(payload):
+    """Replace raw V3 liquidity integers with a self-describing string."""
+    if isinstance(payload, dict):
+        out = {}
+        for key, value in payload.items():
+            if key in _LIQUIDITY_KEYS and isinstance(value, int):
+                out[key] = (
+                    f"{value} V3 liquidity units — NOT a token amount and NOT a "
+                    f"money value; do not scale or report this as TVL"
+                )
+            else:
+                out[key] = _hide_raw_liquidity(value)
+        return out
+    if isinstance(payload, list):
+        return [_hide_raw_liquidity(v) for v in payload]
+    return payload
+
+
 def strat_token_id() -> int:
     import strategy
     return strategy.current_token_id()
@@ -66,7 +99,7 @@ def get_lp_position(token_id: int | None = None) -> dict:
 
     Defaults to the position this agent manages.
     """
-    return pcs.get_lp_position(_managed(token_id))
+    return _hide_raw_liquidity(pcs.get_lp_position(_managed(token_id)))
 
 
 def get_lp_current_range(token_id: int | None = None) -> dict:
@@ -75,8 +108,9 @@ def get_lp_current_range(token_id: int | None = None) -> dict:
 
 
 def get_lp_liquidity(token_id: int | None = None) -> dict:
-    """The position's liquidity and its share of the pool's active liquidity."""
-    return pcs.get_lp_liquidity(_managed(token_id))
+    """The position's share of pool liquidity. NOT a money figure — for the
+    value of the position in USDT, call `get_status_report`."""
+    return _hide_raw_liquidity(pcs.get_lp_liquidity(_managed(token_id)))
 
 
 def get_pending_fees(token_id: int | None = None) -> dict:
@@ -85,9 +119,18 @@ def get_pending_fees(token_id: int | None = None) -> dict:
 
 
 def get_position_summary(token_id: int | None = None) -> dict:
-    """One call for the whole picture: price, range, utilization, liquidity,
-    pending fees, and whether a rebalance is currently required."""
-    return pcs.get_position_summary(_managed(token_id))
+    """Price, range, utilization, pending fees, TVL in USDT, and whether a
+    rebalance is required. For a finished report of the economics, prefer
+    `get_status_report` — its figures are formatted by code."""
+    token_id = _managed(token_id)
+    summary = _hide_raw_liquidity(pcs.get_position_summary(token_id))
+    # The money figure MUST be present. Its absence is what made the model
+    # manufacture a TVL out of the liquidity integer (B9 via B21).
+    try:
+        summary["tvl_usdt"] = pcs.get_position_value(token_id)["tvl_usdt"]
+    except Exception as e:  # noqa: BLE001 — say it is unavailable, never omit it
+        summary["tvl_usdt"] = f"unavailable ({type(e).__name__}) — do not estimate it"
+    return summary
 
 
 def verify_position(token_id: int | None = None, tx_hash: str | None = None) -> dict:

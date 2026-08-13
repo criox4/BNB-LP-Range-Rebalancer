@@ -36,9 +36,17 @@ COPY bnbLpRangeRebalancer/app/ /app/bnbLpRangeRebalancer/app/
 #                        a lock that cannot serialise anything (B10/B11).
 #   STORAGE_LOCAL_PATH — ERC-8183 deliverable manifests. Losing these makes a
 #                        paid job's deliverable_url 404 forever (B23).
+#   STUDIO_AUDIT_LOG_PATH — the signing audit trail. It defaults to
+#                        <project>/.studio/audit-log.jsonl, which is root-owned
+#                        in this image, so the non-root process could not write
+#                        it: paid job 56589 logged "audit log file write failed
+#                        ... Permission denied" and the trail for a real submit
+#                        survived only as stdout. Onto the volume, where it is
+#                        both writable and durable.
 ENV LP_STATE_DIR=/data/state \
-    STORAGE_LOCAL_PATH=/data/deliverables
-RUN mkdir -p /data/state /data/deliverables
+    STORAGE_LOCAL_PATH=/data/deliverables \
+    STUDIO_AUDIT_LOG_PATH=/data/audit/audit-log.jsonl
+RUN mkdir -p /data/state /data/deliverables /data/audit
 VOLUME ["/data"]
 
 # The keystore is NEVER baked in — see .dockerignore, which excludes .studio/.
@@ -48,6 +56,9 @@ VOLUME ["/data"]
 # image deliberately does not contain, and signing fails at the first quote.
 ENV BNBAGENT_KEYSTORE_DIR=/secrets/wallets
 
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # Run as a non-root user; /data must be writable by it.
 RUN useradd --create-home --uid 10001 agent \
     && chown -R agent:agent /data
@@ -55,6 +66,8 @@ USER agent
 
 # 9000 = A2A seller (AgentCore's contract), 8080 = REST service.
 EXPOSE 9000 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # No default CMD: this image has two legitimate entrypoints and picking one
 # silently would make `docker run` start the wrong half. compose sets both.

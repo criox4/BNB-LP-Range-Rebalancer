@@ -255,6 +255,39 @@ def main() -> None:
         print(f"  ok  {t.__name__}")
     print(f"{len(tests)} passed")
 
+# --- The LLM must not be handed a number it can misread as money --------------
+def test_llm_tools_never_expose_a_raw_liquidity_integer():
+    """B9, regressed via B21 and caught by a PAID job (56589).
+
+    `get_position_summary` returned V3 liquidity and no TVL, so the model asked
+    for TVL scaled the liquidity integer and delivered "TVL: 335,389.79 BNB"
+    for a position holding $0.81. main.py already forbade exactly this in the
+    prompt and named that exact figure — prompting did not hold, so the
+    material is withheld instead.
+
+    Offline: no RPC. Asserts the shape of the guard, not live chain values.
+    """
+    import tools
+
+    payload = {
+        "liquidity": {"position_liquidity": 335389792730626532,
+                      "pool_active_liquidity": 1274497388494995892409666},
+        "nested": [{"liquidity_raw": 123456789}],
+        "price": 613.44,
+        "token_id": 7116214,
+    }
+    safe = tools._hide_raw_liquidity(payload)
+
+    assert isinstance(safe["liquidity"]["position_liquidity"], str)
+    assert isinstance(safe["liquidity"]["pool_active_liquidity"], str)
+    assert isinstance(safe["nested"][0]["liquidity_raw"], str)
+    for text in (safe["liquidity"]["position_liquidity"],
+                 safe["nested"][0]["liquidity_raw"]):
+        assert "NOT a token amount" in text and "TVL" in text, text
+
+    # Values that ARE money or identity must pass through untouched.
+    assert safe["price"] == 613.44
+    assert safe["token_id"] == 7116214
 
 if __name__ == "__main__":
     main()

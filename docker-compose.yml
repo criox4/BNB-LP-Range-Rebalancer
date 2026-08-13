@@ -60,7 +60,12 @@ services:
       # The monitor runs in the service, not here. Exactly one, never both.
       AGENT_RUN_MONITOR: "0"
     ports:
-      - "9000:9000"
+      # Loopback ONLY. Docker publishes ports by writing its own iptables rules,
+      # which are consulted BEFORE ufw's — so "9000:9000" on a host with a
+      # deny-by-default firewall is still world-reachable, and `ufw status`
+      # cheerfully reports the port as blocked. Bind the loopback and let the
+      # reverse proxy be the single way in. Override for a host with no proxy.
+      - "${BIND_ADDR:-127.0.0.1}:9000:9000"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/ping"]
       interval: 30s
@@ -81,7 +86,7 @@ services:
       # ever run a second VPS, exactly one of them sets this (spec 11).
       SERVICE_RUN_MONITOR: "1"
     ports:
-      - "8080:8080"
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"   # loopback only — see the agent's note
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s

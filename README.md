@@ -339,7 +339,9 @@ The agent serves two ERC-8183 seller skills over A2A:
   the deliverable in the background and submits it.
 
 `settle` is deliberately operator-driven: `bag erc8183 settle <job_id>`, after
-the contract's 24h dispute window.
+the contract's dispute window — **7 days**, not 24 hours. The value is
+`disputeWindow` on the OptimisticPolicy contract (604800s); read it rather than
+assuming, because `approve` before it elapses reverts `0x17be5b7b`.
 
 **Proven on mainnet** — four paid jobs, real $U, full lifecycle (create →
 register → set_budget → fund → notify_funded → submit):

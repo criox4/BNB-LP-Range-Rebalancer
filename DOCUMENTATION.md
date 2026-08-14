@@ -580,7 +580,12 @@ on-chain job disagrees with the configured list price and that would otherwise
 look like a pricing bug.
 
 **All five jobs are `SUBMITTED` and unsettled.** `approve` reverts `0x17be5b7b`
-until the 24h dispute window elapses (per-job, from its submit block). Job
+until the dispute window elapses (per-job, from its submit block). That window
+is **7 days**, not 24 hours: `disputeWindow()` on the OptimisticPolicy contract
+`0x9C01845705b3078Aa2e8cfF7520a6376FD766dE5` returns 604800 seconds. This
+document previously said 24h throughout — the error was caught by an `approve`
+that reverted `0x17be5b7b` at **37.6 hours** after submit, which is the only
+reason it was checked against the chain rather than assumed. Job
 `56589`'s deliverable carries the B25 TVL error and cannot be replaced — a
 submitted deliverable is final. It is a purchase between two wallets we control,
 so the options are dispute or settle-and-accept.
@@ -743,7 +748,7 @@ on something external.
 | ID | Gap | Blocked by |
 |---|---|---|
 | **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. The migration script is written and dry-run (`migrate_wallet.py`); what remains is a decision and a new keystore. Note the identity NFT is now *worth* migrating — §4.12a spent real gas pointing it at the deployed URL | a decision |
-| **G14** | Settle jobs `56587`–`56591` (`approve` → `COMPLETED`). Calling early reverts `0x17be5b7b`. `56587`'s window opened 08-13 16:51Z; the rest follow through 08-14 | the 24h dispute window, per job |
+| **G14** | Settle jobs `56587`–`56591` (`approve` → `COMPLETED`, signed by the **client**, not the provider). Calling early reverts `0x17be5b7b`. Windows: `56587` from 08-19 16:51Z, `56588` 08-20 07:34Z, `56589` 08-20 09:08Z, `56590` 08-20 10:19Z, `56591` 08-20 14:12Z | the **7-day** dispute window, per job |
 | **G15** | `[storage].kind = "local"` keeps deliverable manifests on one machine's disk. They now survive a container restart (named volume) and are publicly fetchable, but not a host loss or a move. IPFS is the durable answer | a decision |
 | **G16** | **Rate-limit the unauthenticated seller surface.** `notify_funded` with no `job_id` triggers a background scan of all funded jobs; a loop of those is a free way to make the agent hammer RPC. Also `negotiate` signs a priced quote for an **empty** `task_description` — the terms keys are presence-checked, the task itself is not | a decision; neither is exploitable for free work, both are cheap to abuse |
 | **G12** | `range_utilization` definition (§4.6). Ours is distance-from-centre; the spec's own example (704.21 in 630–770 → 87) is not reproducible from those numbers under any reading we found | an answer from the spec author |

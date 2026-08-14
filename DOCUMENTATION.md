@@ -4,10 +4,11 @@ Living record of what was built, why each decision was made the way it was, what
 is verified on-chain, and what remains. Spec reference throughout is
 `BNB Agent Studio Marketplace.md` (v1.0), cited as **§n**.
 
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-14
 **Agent:** #1 of 4 — BNB LP Range Rebalancer (§4), category `rebalancing`, spec Priority 1 (§21)
-**Repo commits:** `c4374cf`, `1c259d4`, `86884d9`, `f7c518d`, `aae0a34`, `dbea070`, `ba303b2`, `36be8c1`, `1274f9d`, `57c866d`, `c41df14`, `aaa3e3c`, `76e97b3`, `3386717`, `b7f3f2d`, `aef1c4e`, `7731cdc`, `1cb6d84`, `14df2ba`
-(rewritten to Conventional Commits; the pre-rewrite history is tagged `backup-pre-conventional`)
+**Repo:** https://github.com/criox4/BNB-LP-Range-Rebalancer (public, `main`)
+**History:** rewritten to Conventional Commits and enforced by `.githooks/commit-msg`;
+the pre-rewrite history is tagged `backup-pre-conventional`.
 
 ---
 
@@ -19,18 +20,19 @@ is verified on-chain, and what remains. Spec reference throughout is
 | Testnet position | `36799` (rebalanced from `36780`, which came from `36779`) |
 | **Mainnet position** | **`7116214`** (rebalanced from `7116193`), live, in range |
 | Agent wallet | `0x20f1cA5d1e5A3Ee94C29DbF95e6BF6ceA6a8d64b` |
-| **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Rebalancer (Test)` |
-| ERC-8004 testnet | `agent_id 1796` — agentURI **rewritten** to `BNB LP Range Rebalancer (Testnet)` (§4.12: registrations are mutable) |
+| **Deployed** | **live on a VPS** — agent `https://bnb-lp.172-104-171-139.nip.io`, service `https://bnb-lp-api.172-104-171-139.nip.io`, TLS auto-renewing (§12) |
+| **ERC-8004 mainnet** | **`agent_id 265375`** — `BNB LP Range Rebalancer`, endpoint repointed to the deployed URL (tx `0x5e6fb704…`) |
+| ERC-8004 testnet | `agent_id 1796` — `BNB LP Range Rebalancer (Testnet)`, endpoint still `localhost` (nothing is deployed there) |
 | Monitor loop | 60s poll; **opt-in** via `$AGENT_RUN_MONITOR` or `$SERVICE_RUN_MONITOR` — exactly one, never two hosts (§11) |
-| Active network | selected by **`$BNB_NETWORK`** (§7), falling back to `[network].default`. Mainnet position `7116214` is untouched and paused |
-| Runtime state | **paused** (will not trade unattended) |
+| Active network | selected by **`$BNB_NETWORK`** (§7), falling back to `[network].default` |
+| Runtime state | **active** on the VPS — monitoring `7116214`, utilization ~2–5%, no rebalance triggered |
 | Service Layer | `app/service` — all 10 §8 routes live on :8080 |
-| Tests | 38 offline (20 math + 11 strategy + 7 service) + live address-book / guard / config checks |
+| Tests | **46 offline** (20 math + 19 strategy/state + 7 service) + live address-book / guard / config checks |
+| Runtime state store | **SQLite** `lp_state.<network>.db` (B24); the legacy JSON file is imported once on first open |
 | Architecture | both §2 layers present: `app/agent` (LLM, strategy, risk, key) + `app/service` (public API, no key) |
 | Unblocked work remaining | **one item** — agents #2–4 |
-| Blocked on credentials | AWS deploy, IPFS storage, public URL |
-| Blocked on a clean wallet | key rotation; a *production* ERC-8004 identity |
-| **ERC-8183** | **closed on mainnet** — job `56587` reached `SUBMITTED`; the testnet buyer path stays blocked (§4.13) |
+| Blocked on a clean wallet | key rotation (G13); `migrate_wallet.py` is written and dry-run against live state |
+| **ERC-8183** | **five paid mainnet jobs**, `56587`–`56591`, all `SUBMITTED`. `56591` is the first delivered from the public URL with a buyer-fetchable `deliverable_url`. Testnet buyer path stays blocked (§4.13) |
 
 **§4.8 Definition of Done is met**: the agent reads a real PancakeSwap V3
 position, detects the rebalance condition, executes on BSC, the transaction
@@ -39,13 +41,14 @@ testnet and then on mainnet with real funds.
 
 **§22 Final Acceptance is not met** and cannot be by this agent alone — it
 requires all four agents. For Agent #1 specifically, Marketplace API, **ERC-8004
-on both networks** and now **ERC-8183 on mainnet** are all satisfied: the full
-lifecycle ran end to end (§6). What remains for this agent is hosting, not code.
+on both networks**, **ERC-8183 on mainnet** and now a **public deployment with a
+real URL** are all satisfied: the full lifecycle ran end to end from the public
+internet (§6, §12).
 
 **Every spec requirement that could be closed by writing code has been closed.**
-What remains needs AWS credentials, a whitelisted buyer policy, elapsed time, or
-an answer from the spec author — plus agents #2–4, which is the bulk of the
-remaining project.
+What remains needs a key rotation decision, a whitelisted buyer policy, elapsed
+time, or an answer from the spec author — plus agents #2–4, which is the bulk of
+the remaining project.
 
 ---
 
@@ -274,7 +277,7 @@ carries `fees_24h_window_complete` — under 24h of watching reports a floor and
 
 ### 4.9 Per-network state and config
 `token_id` is network-specific: an ID minted on testnet names a different (or
-absent) position on mainnet. State files are `.lp_state.<network>.json` so
+absent) position on mainnet. The state store is `lp_state.<network>.db` so
 testnet history is never read as mainnet money, and `check_config_consistency()`
 flags a `token_id` that does not belong to the active chain.
 
@@ -331,11 +334,52 @@ What actually follows:
 1. **Order is a preference, not a constraint.** Registering before a public URL
    exists is fine; point the endpoint at the real URL afterwards. Registration
    is no longer a one-shot.
-2. Mainnet `265375` still says `BNB LP Rebalancer (Test)` and `localhost` — both
-   now fixable, and worth fixing once the deploy has a real URL rather than
-   burning gas on an interim value.
-3. `register --agent-uri` with an `https://` URL is still the cheapest way to
+2. `register --agent-uri` with an `https://` URL is still the cheapest way to
    keep the document editable **off-chain**, i.e. without a transaction per edit.
+
+### 4.12a Mainnet identity repointed — and the CLI can no longer reach it
+
+**2026-08-14**, tx `0x5e6fb704…` (block 115826415, 313,986 gas). One
+`setAgentURI` replaced all three stale fields on `265375`:
+
+| | before | after |
+|---|---|---|
+| `name` | `BNB LP Rebalancer (Test)` | `BNB LP Range Rebalancer` |
+| `description` | "Test identity - not the production deploy wallet." | what the agent does + the REST API |
+| `services[0].endpoint` | `http://localhost:9000/.well-known/agent-card.json` | `https://bnb-lp.172-104-171-139.nip.io/.well-known/agent-card.json` |
+
+Verified by walking the chain a buyer walks: `resolve 265375` → endpoint →
+agent card (`url` matches) → skills `negotiate` + `notify_funded`. Every link
+was broken before, because the endpoint resolved to the buyer's own machine.
+
+**This had to bypass the CLI, and always will from now on.** `bag erc8004
+show / update-endpoint` locate an agent through `_find_owned_agent`, which pages
+the **8004scan indexer** — an HTTP service, not the chain — and stops after 1000
+agents, newest-first. Mainnet mints roughly that many per day. Agent `265375`
+sat at offset ~800 on 08-13 and had aged out by 08-14:
+
+```
+$ bag erc8004 show --network bsc-mainnet
+error: Wallet 0x20f1cA5d… has no registered agent.      # while tokenURI reads fine
+```
+
+Testnet `1796` still resolves through the same command, which isolates it to the
+indexer window rather than the wallet or config. So identity edits go by token id
+through `_set_agent_uri_audited(sdk, agent_id, uri, network)`, which skips the
+lookup and keeps the audit record. That is also the *only* route that can change
+`name`: `update-endpoint` has no `--name` flag at all.
+
+Two consequences worth carrying:
+
+* **`bag erc8004 resolve <id>` still works** — it reads the chain directly. Use
+  it, not `show`, for anything about this agent.
+* **Discovery UIs lag.** 8004scan snapshots at registration; testnet `1796`'s
+  rewrite from 08-13 still is not reflected in its indexed `name`. Expect the old
+  name to linger in explorers regardless of chain state.
+
+The stale endpoint was not cosmetic. It is why job `56591`'s `buy_workflow`
+returned `seller_endpoint=None` and never sent `notify_funded` — a third-party
+buyer would fund and then stall (§5 round 5).
 
 ### 4.13 ERC-8183 buying is broken on testnet, not in our code
 
@@ -455,6 +499,25 @@ why `$BNB_NETWORK` exists — the network was previously *three* coupled edits
 (`[network].default`, `token_id`, `currency`), and B7 and B22 are both what
 happens when one of the three drifts.
 
+### Round 5 — found by deploying to a real host
+
+Every one of these is invisible on a developer machine. They are what a Linux
+VPS, a firewall and a public URL surface that OrbStack and `localhost` do not.
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| B27 | **The public agent card advertised `http://localhost:9000/`** | `card.url` was overridden only by `$AGENTCORE_RUNTIME_URL`, which AWS AgentCore sets and a self-hosted VPS never does. So the first real deployment served a valid, TLS-terminated, publicly reachable agent card **pointing at the buyer's own machine**. It does not fail — nothing errors, the card resolves, and every buyer who follows it dials `localhost` | `agent_card.py` honours `$PUBLIC_URL`, falling back to the **origin of `$ERC8183_AGENT_URL`** so the card and the on-chain deliverable URL cannot name two different hosts. Pinned by a test |
+| B28 | **Docker was about to publish both ports past the firewall** | `docker-compose.yml` published `9000:9000` and `8080:8080`, i.e. `0.0.0.0`. Docker writes its own iptables rules, consulted **before** ufw's, so on a host whose `ufw status` shows only 22/80/443 open, both ports were nonetheless world-reachable. The firewall reports the port as blocked while it is not | bind `${BIND_ADDR:-127.0.0.1}` and let nginx be the single ingress. `BIND_ADDR` overrides for a host with no proxy |
+| B29 | **A correct-looking keystore could not be read by the agent** | copied to the VPS as `600 root:root`; the container runs as uid **10001**. The agent boots fine, passes its healthcheck, and fails only at the *first signature* — surfaced as a bare `PermissionError` through the A2A error channel. macOS Docker remaps ownership and hides this entirely | `chown 10001:10001` the keystore; documented in the README deploy section and in `migrate_wallet.py`'s closing checklist |
+| B30 | **`get_deliverable_url` returns nothing on a public RPC** | not our bug, but it breaks the flow the agent card documents. The URL lives in a `JobInitialised` event's `optParams` on the **policy** contract, so recovering it needs a log scan. Without a `hint_block` the SDK falls back to a **1000-block window** (~50 min on BSC), which every hours-old submit falls outside; and even with the exact block, `bsc-dataseed` rejects the query with a range limit. The SDK correctly raises `RpcRangeLimitError` rather than `None` — but `bag erc8183 status` flattens it to `deliverable_url: None`, which reads as "no deliverable was published" | none in our code. Confirmed the URL **is** on-chain by decoding the submit receipt's policy log directly. Operationally this needs an archive-capable or paid RPC endpoint; the CLI's `None` is not evidence of absence |
+| B31 | **`buy_workflow` funds a job and never requests delivery** | it resolves the seller's endpoint from the ERC-8004 identity. With that document still saying `localhost`, it returned `seller_endpoint=None`, completed `create → register → set_budget → fund`, and stopped. Negotiation worked throughout because the URL was passed directly — so the failure is invisible until a buyer relies on discovery | root cause fixed by repointing the identity (§4.12a). Job `56591` was completed by sending `notify_funded` over A2A manually |
+
+The through-line in this round: **each failure is silent on the happy path.**
+A card that resolves, a firewall that reports closed, a container that reports
+healthy, a CLI that returns `None`, a buy that returns a `BuyResult`. None of
+them raise. Round 4 was found by running a paid job; round 5 was found by
+running one *from somewhere else*.
+
 ---
 
 ## 6. On-chain evidence
@@ -471,7 +534,7 @@ interaction with a verified agent wallet.
 | Swap WBNB→USDT | `c0cd45744c29bb4596c163c9538bea8286878b58b5208082f0dd80f45d6c6e3e` |
 | Rebalance `36779`→`36780` | `28360b8b…`, `f875e01e…`, `befff314…` |
 | **Rebalance `36780`→`36799`** (out-of-range trigger) | `476a88fe…`, `a4c16c0e…`, `b45f4421…`, `0b01f266…` |
-| ERC-8004 agent id | `1796` (agentURI frozen as `fxagent` — see G3) |
+| ERC-8004 agent id | `1796` — agentURI **rewritten** to `BNB LP Range Rebalancer (Testnet)` (`0x8750df07…`, restored `0x72a11909…`), which is what disproved the "frozen" claim (§4.12). Endpoint still `localhost`; nothing is deployed on testnet |
 | ERC-8004 metadata `name` | `2ea29e31c795f2fca28af519d01e645ba6a44052a4e02ae56f835e2d8a768f28` |
 | ERC-8004 metadata `description` | `7aaf767a3c2ff600821edfee9f9b8ba2b25eeee7def97287c67b141bfb208354` |
 
@@ -496,6 +559,8 @@ this does not arise (see §4.10).
 | Mint → position `7116193` | `55fdd0a4d688be7eb12dd958146d018ebdfe88b059e6ffc2aa50fac4da9c5c3d` |
 | **Rebalance `7116193`→`7116214`** | `7068e8c3…`, `73890896…`, `4f2e4d57…` (gas $0.019) |
 | **ERC-8004 registration** | `agent_id 265375`, registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` |
+| **ERC-8004 identity repointed** | `0x5e6fb704356318460a6e35cc999a5ea64e6162f26043d72072bd756e615b416b` (block 115826415, 313,986 gas). Name, description and A2A endpoint replaced in one `setAgentURI` — see §4.12a |
+| **ERC-8183 job `56591`, delivered from the public URL** | create `0x75192923…`, register `0x162cd3ec…`, set_budget `0x4b71a852…`, fund `0x64bfc7bd…`, **submit `0xaccf450c…`** (block 115710443). First job whose on-chain `deliverable_url` is publicly fetchable: `https://bnb-lp.172-104-171-139.nip.io/erc8183/job/56591/response`, pulled back over the internet exactly as a buyer would. Priced 0.05 U (see note below) |
 | **ERC-8183 job `56587` submitted** | `4bd0271912b1dc9aa2e7f80c9b858db5d4ba3481401f2ff146a72ea9417d6836` (block 115539760) |
 | **ERC-8183 job `56590`, the fixes proven** | create `0xef1661d1…`, register `0x6c253489…`, set_budget `0x1a6e5584…`, fund `0xe21479d2…`, submit `0xe3b87d79…`. Delivered **TVL 0.8126 USDT** (B25 fixed), carried APR and 30D PnL with their window flags (G7), and wrote a durable audit record (B26). The buyer fetched it over HTTP |
 | **ERC-8183 job `56589`, containerised** | create `0xeb94d345…`, register `0xb6d5c031…`, set_budget `0xe68eb6f6…`, fund `0x7d3df15a…`, submit `0x41f55948…`. Delivered from the Docker image, deliverable fetched back over HTTP. Its report carried the B25 TVL error |
@@ -505,6 +570,20 @@ this does not arise (see §4.10).
 Position `7116214`: range $548.22–$670.27, TVL ~$0.81, in range.
 TVL reconciles with the $0.85 committed once the swap fee and $0.04 of WBNB
 dust are accounted for.
+
+**On job `56591`'s price.** The list price is 0.1 U; this job was quoted 0.05 U
+because the buyer wallet held 0.0724 U and the alternative was leaving the
+public-URL path untested. `[payments.erc8183].price` was lowered, the job run,
+and the value restored — verified by a fresh quote reading 0.1 U again. Both
+wallets are ours, so no third party saw the discount. Worth recording because the
+on-chain job disagrees with the configured list price and that would otherwise
+look like a pricing bug.
+
+**All five jobs are `SUBMITTED` and unsettled.** `approve` reverts `0x17be5b7b`
+until the 24h dispute window elapses (per-job, from its submit block). Job
+`56589`'s deliverable carries the B25 TVL error and cannot be replaced — a
+submitted deliverable is final. It is a purchase between two wallets we control,
+so the options are dispute or settle-and-accept.
 
 ### Verified contract addresses
 
@@ -541,12 +620,17 @@ export WALLET_PASSWORD=<password>          # never persisted to disk by design
 # Bootstrap a position
 .venv/bin/python mint_position.py --bnb 0.0014 --dry-run
 
-# Tests
-.venv/bin/python test_blockchain.py          # 14 unit tests, no network
+# Tests — 46 offline
+.venv/bin/python test_blockchain.py          # 20 range / tick / liquidity math
 .venv/bin/python test_blockchain.py --live   # + live chain/address/guard checks
-.venv/bin/python test_strategy.py            # 9 accounting / locking / config
-.venv/bin/python test_service.py             # 6 REST routes + auth gating
+.venv/bin/python test_strategy.py            # 19 accounting / state store / locking
+.venv/bin/python test_service.py             #  7 REST routes + auth gating
 .venv/bin/python test_service.py --live      # + every read route answers 200
+
+# test_strategy.py imports the ADK, which the workspace venv does not carry.
+# Run the full suite in the image instead:
+#   docker run --rm -w /app/bnbLpRangeRebalancer/app/agent bnb-lp-rebalancer:latest \
+#     sh -c 'for t in test_blockchain test_strategy test_service; do python $t.py; done'
 
 # Full runtime (A2A + monitor loop)
 cd bnbLpRangeRebalancer && WALLET_PASSWORD=... ../.venv/bin/bag dev
@@ -658,12 +742,10 @@ on something external.
 
 | ID | Gap | Blocked by |
 |---|---|---|
-| **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. Acceptable while the wallet holds $0.81 of a throwaway position; not acceptable before real value | a decision |
-| **G3** | §10 ERC-8004 **production** identity. Both networks are registered on the compromised wallet with `localhost` endpoints. Name/description/endpoint are all rewritable on-chain (§4.12), so this is now a `setAgentURI` call once a public URL exists — not a re-registration. The wallet is the only part that cannot be edited | a fresh wallet (G13) for the *owner*; a public URL (G10) for the endpoint |
-| **G14** | Settle job `56587` (`approve` → `COMPLETED`). Calling it early reverts `0x17be5b7b` | the 24h dispute window |
-| **G15** | `deliverable_url` is fetchable now (B23 fixed) but points at **`localhost`**, and `[storage].kind = "local"` keeps the manifest on one machine's disk. Fine for a local buyer; a remote one needs a public URL, and surviving a redeploy needs IPFS | G9/G10 |
-| **G9** | Deploy: AWS credentials unset; `[storage].kind = "local"` is not deployable (needs IPFS) | credentials |
-| **G10** | §19 public service URL | G9 |
+| **G13** | **Rotate the wallet key and the OpenRouter key.** Both were pasted in plaintext during development and are in the session transcript. The migration script is written and dry-run (`migrate_wallet.py`); what remains is a decision and a new keystore. Note the identity NFT is now *worth* migrating — §4.12a spent real gas pointing it at the deployed URL | a decision |
+| **G14** | Settle jobs `56587`–`56591` (`approve` → `COMPLETED`). Calling early reverts `0x17be5b7b`. `56587`'s window opened 08-13 16:51Z; the rest follow through 08-14 | the 24h dispute window, per job |
+| **G15** | `[storage].kind = "local"` keeps deliverable manifests on one machine's disk. They now survive a container restart (named volume) and are publicly fetchable, but not a host loss or a move. IPFS is the durable answer | a decision |
+| **G16** | **Rate-limit the unauthenticated seller surface.** `notify_funded` with no `job_id` triggers a background scan of all funded jobs; a loop of those is a free way to make the agent hammer RPC. Also `negotiate` signs a priced quote for an **empty** `task_description` — the terms keys are presence-checked, the task itself is not | a decision; neither is exploitable for free work, both are cheap to abuse |
 | **G12** | `range_utilization` definition (§4.6). Ours is distance-from-centre; the spec's own example (704.21 in 630–770 → 87) is not reproducible from those numbers under any reading we found | an answer from the spec author |
 
 ### Closed
@@ -682,13 +764,31 @@ on something external.
 | — | §14 log fields *demonstrated* | testnet rebalance `36780`→`36799` is the first entry carrying the full set |
 | — | B18 `input_amount` logged zeros | derived from `get_position_value`, not `tokensOwed` (§5 bug log) |
 | ~~G7~~ | §17/§18 card fields APR and 30D PnL | both present, each with the flag that says whether its window is real. `apr` is **None**, not 0, when the basis is too thin to annualise, and `pnl_30d` is withheld until 30 days are actually observed — the same discipline B14 forced on `fees_24h`. Was filed as "blocked on elapsed time"; the fields were implementable all along, it was the *unqualified* versions that needed the wait |
+| ~~G9~~ | Deploy | Docker + nginx on a VPS (§12), not AWS. `[storage].kind = "local"` turned out not to block it — a named volume makes the manifests durable enough to serve; only host-loss survival still wants IPFS (G15) |
+| ~~G10~~ | §19 public service URL | `https://bnb-lp.172-104-171-139.nip.io` (agent) and `https://bnb-lp-api.172-104-171-139.nip.io` (service), Let's Encrypt, renewal dry-run verified |
+| ~~G3~~ | §10 ERC-8004 production identity | tx `0x5e6fb704…` — name, description and endpoint all corrected on the existing `agent_id 265375` (§4.12a). The *owner* is still the compromised wallet; that part moves with G13 |
 | ~~G4~~ | §11 `notify_funded` end-to-end | **mainnet job `56587`**: `negotiate` over A2A → `create` → `register` → `set_budget` → `fund` → `notify_funded` → on-chain `submit`, `SUBMITTED` (§6). `register` is the step that reverts on testnet, which confirms §4.13 exactly. Two things the flow required and nothing documented: `ERC8183_AGENT_URL` must point at the seller's `/erc8183` mount, and the budget must **equal** the quoted price, not exceed it |
 
-**Note on G13.** Rotating is cheap; the ordering is what costs. The correct
-sequence is now: **new wallet → fund → deploy (G9/G10) → register ERC-8004 with
-the real public URL → migrate the position.** Registration must come *last*,
-because the endpoint is frozen at registration time — which is the opposite of
-what this session assumed going in. See §4.12.
+**Note on G13.** Rotating is cheap; the ordering is what costs — and the earlier
+version of this note had the ordering *wrong*, on the since-corrected belief that
+registration was one-shot (§4.12). It is not. The sequence is:
+
+1. `bag wallet new` — from a **different** directory or with `--keystore-dir`.
+   Run in the project it rewrites `[wallet].address` in `studio.toml`, and the
+   agent switches signer on its next restart to a wallet that owns nothing.
+2. Settle `56587`–`56591` **first**. `provider` is recorded per job on-chain;
+   an already-submitted job pays the old address no matter what moves.
+3. `python migrate_wallet.py --to 0xNEW --agent-id 265375` — dry run, then
+   `--execute`. Moves the LP position NFT and the ERC-8004 identity NFT, then
+   sweeps the native balance last (the transfers need gas).
+4. `studio.toml`, the VPS keystore (`chown 10001:10001`, B29), `WALLET_PASSWORD`,
+   redeploy.
+5. One more `setAgentURI` — the identity NFT moves, but its *document* is
+   unchanged and its `registrations[]` still self-describes correctly. Only
+   needed if name/description/endpoint should change too.
+
+The two NFTs are the whole reason this needs a script: `bag wallet` has
+`new / show / list / sign / balance / policy` and **no transfer of any kind**.
 
 ---
 
@@ -700,7 +800,7 @@ The agent is two long-lived processes over one position:
 app/agent/main.py      A2A seller     :9000   negotiate + notify_funded   (signs)
 app/service/main.py    REST API       :8080   §8 routes + /execute        (signs)
                             │
-                            └── .lp_state.<network>.json   ← ONE writer
+                            └── lp_state.<network>.db     ← ONE writer (SQLite, B24)
 ```
 
 **Exactly one process may run the monitor loop, and it is chosen explicitly.**
@@ -766,14 +866,82 @@ rebalance mints a new NFT.
 | `LP_STATE_DIR` | state **and** lock relocate; network stays in the filename; the repo's own state file untouched |
 | guard test | fails on an ungated `start_monitor()` — confirmed against a simulated regression, not assumed |
 
-31 offline tests pass (14 blockchain + 11 strategy + 6 service).
+46 offline tests pass (20 blockchain + 19 strategy + 7 service).
 
-### Not yet decided
+### Where it actually runs — decided
 
-Where the always-on host lives. The changes above are host-agnostic: the
-AgentCore entrypoint (`agentcore.json` → `entrypoint: main.py`,
-`codeLocation: app/agent/`) is an ordinary Python program with a `__main__` that
-runs uvicorn, so `python main.py` serves the identical A2A agent on EC2, Railway,
-Fly or a VPS. Self-hosting does drop AgentCore's mandatory authorizer: the
-endpoint is never anonymous there (IAM, or Cognito OAuth2 for external buyers),
-and nothing replaces that automatically.
+A VPS, not AgentCore. The entrypoint was always host-agnostic
+(`agentcore.json` → `entrypoint: main.py` is an ordinary Python program with a
+`__main__` that runs uvicorn), so `python main.py` serves the identical A2A agent
+anywhere. Self-hosting does drop AgentCore's mandatory authorizer — the endpoint
+is never anonymous there (IAM, or Cognito OAuth2 for external buyers) — and
+nothing replaces that automatically. For the seller surface that is acceptable:
+`negotiate` signs a quote that costs the buyer money to act on, and
+`notify_funded` refuses anything not verified funded on-chain (see G16 for the
+part that is *not* fine).
+
+---
+
+## 12. The VPS deployment
+
+Two containers from **one image**, behind nginx. The two §2 layers are separate
+processes by design but share a dependency set — `app/service` imports
+`strategy.py` / `risk.py` / `blockchain.py` straight out of `app/agent` — so two
+Dockerfiles would only be two ways to drift.
+
+```
+                    ┌─ https://bnb-lp.172-104-171-139.nip.io      → 127.0.0.1:9000  agent
+internet → nginx ───┤
+   (TLS)            └─ https://bnb-lp-api.172-104-171-139.nip.io  → 127.0.0.1:8080  service
+```
+
+| | |
+|---|---|
+| Build context | the **repo root**, not `bnbLpRangeRebalancer/` — `blockchain.py` finds `config/bsc-contracts.json` by walking parents (§13) |
+| User | uid 10001, non-root. See B29 |
+| Ports | loopback only. See B28 |
+| Volume | one named volume at `/data` — state, deliverables, audit log |
+| Keystore | bind-mounted read-only; `.dockerignore` excludes `.studio/` so no key can enter a layer |
+| Monitor | `SERVICE_RUN_MONITOR=1` on the service container only |
+| TLS | Let's Encrypt, both hostnames on one cert, `certbot.timer` active, renewal dry-run verified |
+
+**Two hostnames, not one path-routed host.** `/health` belongs to the service
+and `/ping` to the agent; a mis-scoped `location` answers silently from the wrong
+process. The agent's hostname is the one published on-chain by `submit_result`,
+so it must not change while any submitted job is unsettled.
+
+**Why the cert matters more than usual:** the deliverable URL written into a
+submit transaction is `https://`. If renewal silently broke, every published
+deliverable would start failing TLS at expiry with nothing on-chain to correct.
+Hence verifying `certbot renew --dry-run`, not just that the cert exists.
+
+### Migrating state onto a host
+
+A fresh volume reads as a **brand-new agent** — `rebalance_count 0`, no history,
+`token_id` back to the bootstrap value — while the on-chain position is
+unchanged. That is B10 by way of deployment. Copy first:
+
+```bash
+docker cp lp_state.<network>.db  bnb-lp-service:/data/state/
+docker cp erc8183-job-*.json     bnb-lp-service:/data/deliverables/
+docker exec -u root bnb-lp-service chown -R 10001:10001 /data
+```
+
+Deliverables matter as much as state: without them every already-paid job's
+`deliverable_url` 404s forever (B23).
+
+Verified on the live host: state survived a full `docker compose restart`
+byte-identical across `rebalance_count`, `gas_spent_bnb`, `fees_collected_usdt`,
+`snapshots_recorded` and the original rebalance's tx hash.
+
+### Operational notes
+
+* **`studio.toml` is baked into the image.** Editing it on the host does
+  nothing until `docker compose up -d --build`. Cost a confused minute during the
+  56591 price change.
+* **`docker compose` needs the env sourced** — the file uses `${VAR:?}` guards,
+  so a bare `docker compose stop` fails before doing anything.
+* **Long-lived `docker logs -f` over SSH dies.** The connection is reaped on
+  idle (exit 255) regardless of `ServerAliveInterval`; it looks exactly like the
+  agent stopping. Docker retains the logs, so `--since` recovers any window —
+  or run the follow under `tmux` on the host.

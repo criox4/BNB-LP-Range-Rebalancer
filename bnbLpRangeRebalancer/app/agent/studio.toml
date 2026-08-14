@@ -75,9 +75,18 @@ max_slippage_pct = 1.0     # swap guard; the testnet pool is shallow enough that
 kind = "local"
 
 [identity]
-# Written by `bag erc8004 register`. NOTE this records the MAINNET registration;
-# the ERC-8004 agent_id is per-network and testnet is 1796 (its agentURI is
-# frozen naming "fxagent" — see DOCUMENTATION.md 4.12).
-endpoint = "http://localhost:9000/.well-known/agent-card.json"
+# Written by `bag erc8004 register`. Records the MAINNET registration (265375);
+# the agent_id is per-network and testnet is 1796.
+#
+# The agentURI is MUTABLE — setAgentURI replaces the whole document, so name,
+# description and endpoint are all fixable in place on the same agent id.
+# Mainnet was repointed here from http://localhost:9000/... in tx 0x5e6fb704.
+#
+# NOTE the CLI can no longer reach this agent: `bag erc8004 update-endpoint`
+# finds it via the 8004scan indexer, which only scans the newest ~1000 agents,
+# and 265375 has aged out — `bag erc8004 show --network bsc-mainnet` reports
+# "no registered agent" for a token that reads fine on-chain. Update it by
+# token id through the library instead (see DOCUMENTATION.md 4.12).
+endpoint = "https://bnb-lp.172-104-171-139.nip.io/.well-known/agent-card.json"
 registered_at = "2026-08-12T09:16:09.598559+00:00"
 agent_id = 265375

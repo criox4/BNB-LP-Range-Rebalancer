@@ -33,7 +33,10 @@ client = TestClient(api.app, raise_server_exceptions=False)
 
 def test_every_spec8_route_is_registered():
     """Offline: the routes exist, whatever the chain is doing."""
-    paths = {r.path for r in api.app.routes}
+    # getattr, not r.path: include_router() also leaves a router marker object
+    # in app.routes that carries no path, and this test is about spec 8's
+    # routes existing — not about every entry being a route.
+    paths = {p for p in (getattr(r, "path", None) for r in api.app.routes) if p}
     missing = [p for p in READ_ROUTES + CONTROL_ROUTES if p not in paths]
     assert not missing, f"spec 8 routes not registered: {missing}"
 
@@ -118,6 +121,39 @@ def _live_read_routes():
         assert r.status_code == 200, (route, r.status_code, r.text[:200])
         print(f"  ok  GET {route}")
     print("live read routes OK")
+
+
+def test_dashboard_is_gated_and_fails_soft():
+    """The dashboard must never be readable without the key, and never blank.
+
+    Three failures in one test because they share a fixture: an unset key is a
+    503 (closed, not open), a wrong key is a 401, and a section whose builder
+    throws degrades to {"error": ...} for that section rather than 500-ing the
+    whole page. The shell must also carry no credential of its own.
+    """
+    import dashboard as dash
+
+    client = TestClient(api.app)
+    saved = os.environ.pop("SERVICE_API_KEY", None)
+    try:
+        assert client.get("/dashboard/data").status_code == 503
+
+        os.environ["SERVICE_API_KEY"] = "dash-test-key"
+        assert client.get("/dashboard/data").status_code == 401
+        assert client.get("/dashboard/data",
+                          headers={"X-API-Key": "wrong"}).status_code == 401
+
+        def boom():
+            raise RuntimeError("rpc gone")
+        assert dash._section("position", boom) == {"error": "RuntimeError: rpc gone"}
+
+        page = client.get("/dashboard")
+        assert page.status_code == 200
+        assert "dash-test-key" not in page.text
+    finally:
+        os.environ.pop("SERVICE_API_KEY", None)
+        if saved is not None:
+            os.environ["SERVICE_API_KEY"] = saved
 
 
 def main() -> None:

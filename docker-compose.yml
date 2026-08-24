@@ -82,6 +82,10 @@ services:
     environment:
       <<: *common-env
       SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY on the host}
+      # The TermiX agent this wallet lists its quant strategy under. Optional:
+      # unset simply means the dashboard's clients card says "not listed",
+      # which is the truth for a deployment that only manages its own LP.
+      TERMIX_AGENT_ID: ${TERMIX_AGENT_ID:-}
       # This container owns the 60s poll. An flock cannot span hosts, so if you
       # ever run a second VPS, exactly one of them sets this (spec 11).
       SERVICE_RUN_MONITOR: "1"

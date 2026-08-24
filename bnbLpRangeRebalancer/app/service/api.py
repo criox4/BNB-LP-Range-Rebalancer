@@ -45,6 +45,8 @@ import blockchain as chain  # noqa: E402
 import risk  # noqa: E402
 import strategy as strat  # noqa: E402
 
+from dashboard import router as dashboard_router  # noqa: E402
+
 SERVICE_NAME = "bnb-lp-range-rebalancer"
 VERSION = "1.0.0"
 
@@ -317,3 +319,10 @@ def execute(force: bool = False, x_api_key: str | None = Header(default=None)) -
         return strat.rebalance(force=force)
     except Exception as e:  # noqa: BLE001
         return _fail(e)
+
+
+# --- Operator dashboard ---------------------------------------------------------
+# Gated separately from the control routes but by the same key: it is read-only,
+# yet it pairs the signer's balances with the position, which no public route
+# does. See dashboard.py.
+app.include_router(dashboard_router, tags=["Dashboard"])

@@ -1,0 +1,401 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BNB LP Range Rebalancer — Operator Dashboard</title>
+<!--
+  Operator dashboard.
+
+  Contains NO credential. The key the operator types lives in sessionStorage and
+  is sent as X-API-Key; baking one into this file would put it in every proxy
+  log and browser cache between the box and the browser.
+
+  No CDN, no build step, no framework: this page has to render when the thing it
+  is diagnosing is half down, and a dashboard with an external dependency is a
+  dashboard that fails at exactly the wrong moment.
+-->
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --line:#e3e6ea; --text:#14161a; --dim:#5d6470;
+    --ok:#1a8a3a; --warn:#9a5b00; --bad:#d70015; --accent:#0071e3; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  @media(prefers-color-scheme:dark){
+    :root{--bg:#0f1013;--card:#17191d;--line:#282b31;--text:#e9ebee;--dim:#9aa1ac;
+          --ok:#32d158;--warn:#ffb340;--bad:#ff453a;--accent:#2b8fff}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+         padding:16px 22px;border-bottom:1px solid var(--line);background:var(--card);
+         position:sticky;top:0;z-index:10}
+  h1{font-size:16px;margin:0;font-weight:650;letter-spacing:-.01em}
+  main{padding:22px;max-width:1400px;margin:0 auto}
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:0}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);
+           margin:0 0 12px;font-weight:600}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+  .kv dt{color:var(--dim);white-space:nowrap}
+  .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;
+         overflow-wrap:anywhere;font-family:var(--mono);font-size:12.5px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11.5px;
+        font-weight:600;border:1px solid var(--line)}
+  .ok{color:var(--ok);border-color:currentColor}
+  .warn{color:var(--warn);border-color:currentColor}
+  .bad{color:var(--bad);border-color:currentColor}
+  .dim{color:var(--dim)}
+  input,button{font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--line);
+               background:var(--card);color:var(--text)}
+  button{cursor:pointer;font-weight:600}
+  button.primary{background:var(--accent);color:#fff;border-color:transparent}
+  .wide{grid-column:1/-1}
+  .scroll{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+  td.mono{font-family:var(--mono)}
+  .err{color:var(--bad);font-size:12.5px;font-family:var(--mono)}
+  .empty{color:var(--dim);font-size:13px;padding:8px 0}
+  a{color:var(--accent)}
+  #gate{max-width:420px;margin:14vh auto;text-align:center}
+  #gate p{color:var(--dim);font-size:13px}
+
+  /* The range bar. The position lives between two prices; a number pair states
+     that, a bar shows how close the next rebalance is. */
+  .bar{position:relative;height:8px;border-radius:99px;background:var(--line);margin:14px 0 6px}
+  .bar .fill{position:absolute;inset:0 auto 0 0;border-radius:99px;background:var(--ok)}
+  .bar .fill.warn{background:var(--warn)} .bar .fill.bad{background:var(--bad)}
+  .bar .tick{position:absolute;top:-3px;width:2px;height:14px;background:var(--bad);opacity:.75}
+  .bar .spot{position:absolute;top:-5px;width:3px;height:18px;background:var(--text);border-radius:2px}
+  .scale{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);
+         font-family:var(--mono)}
+</style>
+
+<div id="gate" hidden>
+  <h1>BNB LP Range Rebalancer</h1>
+  <p>Operator dashboard. Enter the agent's API key.</p>
+  <p><input id="key" type="password" placeholder="API key" style="width:100%"></p>
+  <p><button class="primary" id="unlock" style="width:100%">Unlock</button></p>
+  <p id="gateErr" class="err"></p>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>BNB LP Range Rebalancer</h1>
+    <span id="statusPill" class="pill dim">…</span>
+    <span id="net" class="dim" style="font-size:12.5px"></span>
+    <span style="flex:1"></span>
+    <span id="stamp" class="dim" style="font-size:12px"></span>
+    <button id="refresh">Refresh</button>
+    <button id="lock">Lock</button>
+  </header>
+  <main><div class="grid" id="cards"></div></main>
+</div>
+
+<script>
+const KEY = "lp-dashboard-key";
+const $ = (id) => document.getElementById(id);
+let timer = null;
+
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const num = (v, d = 2) =>
+  v === null || v === undefined || v === "" || Number.isNaN(Number(v))
+    ? "—" : Number(v).toLocaleString("en-US", { maximumFractionDigits: d });
+
+const ago = (iso) => {
+  if (!iso) return "never";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+};
+
+const card = (title, body, wide) =>
+  `<section class="card${wide ? " wide" : ""}"><h2>${esc(title)}</h2>${body}</section>`;
+const kv = (rows) => `<dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl>`;
+const bad = (s) => `<span class="err">${esc(s.error)}</span>`;
+const flag = (on, yes = "yes", no = "no", invert = false) =>
+  `<span class="pill ${on !== invert ? "ok" : "warn"}">${on ? yes : no}</span>`;
+const tx = (ex, h) => `<a href="${ex}/tx/${esc(h)}" target="_blank" rel="noopener">${esc(h.slice(0, 12))}…</a>`;
+
+// Utilisation is where spot sits between the bounds, 0 at the lower bound and
+// 100 at the upper. Both EXTREMES are the danger, not one — so colour by
+// distance from the middle, and let the agent's own trigger prices draw the
+// red marks rather than picking a threshold here that could disagree with it.
+const edgeClass = (u) => {
+  if (u == null) return "";
+  const d = Math.abs(50 - u);
+  return d >= 45 ? "bad" : d >= 35 ? "warn" : "";
+};
+
+function rangeBar(p, tr) {
+  if (p?.lower_price == null || p?.upper_price == null) return "";
+  const lo = p.lower_price, hi = p.upper_price, span = hi - lo;
+  if (!(span > 0)) return "";
+  const pct = (v) => Math.max(0, Math.min(100, ((v - lo) / span) * 100));
+  const u = p.range_utilization;
+  const marks = tr && !tr.error
+    ? `<span class="tick" style="left:${pct(tr.trigger_lower_price)}%"></span>
+       <span class="tick" style="left:${pct(tr.trigger_upper_price)}%"></span>` : "";
+  return `<div class="bar">
+      <span class="fill ${edgeClass(u)}" style="width:${num(u, 1)}%"></span>
+      ${marks}<span class="spot" style="left:${pct(p.current_price)}%"></span>
+    </div>
+    <div class="scale"><span>${num(lo)}</span>
+      <span class="dim">spot ${num(p.current_price)} · ${num(u, 1)}% through range</span>
+      <span>${num(hi)}</span></div>`;
+}
+
+function render(d) {
+  const ex = d.agent?.explorer || "https://bscscan.com";
+  const out = [];
+
+  // ── agent ───────────────────────────────────────────────────────────────
+  if (d.agent?.error) out.push(card("Agent", bad(d.agent)));
+  else {
+    const a = d.agent;
+    const degraded = a.rpc !== "up" || a.protocol === "unavailable"
+      || (a.config_problems || []).length > 0;
+    $("statusPill").textContent = degraded ? "degraded" : a.status;
+    $("statusPill").className = "pill " + (degraded ? "bad" : a.status === "active" ? "ok" : "warn");
+    $("net").textContent = `${a.network} · chain ${a.chain_id ?? "?"}`;
+
+    // last_check is the only proof a monitor pass COMPLETED. monitor_running
+    // says a thread exists — a thread throwing on every pass still reports
+    // true, so a stale timestamp against an active strategy is the real alarm.
+    const stale = a.last_check
+      && (Date.now() - new Date(a.last_check).getTime()) / 1000 > (a.poll_seconds || 60) * 5;
+    out.push(card("Agent", kv([
+      ["strategy", `<span class="pill ${a.status === "active" ? "ok" : "warn"}">${esc(a.status)}</span>`],
+      ["monitor thread", flag(a.monitor_running, "running", "stopped")],
+      ["last completed pass", `<span class="${stale ? "bad" : "dim"}">${esc(ago(a.last_check))}</span>`],
+      ["poll interval", esc(a.poll_seconds) + "s"],
+      ["rpc", `<span class="pill ${a.rpc === "up" ? "ok" : "bad"}">${esc(a.rpc)}</span>`],
+      ["block", num(a.block, 0)],
+      ["pancakeswap v3", `<span class="pill ${a.protocol === "up" ? "ok" : "bad"}">${esc(a.protocol ?? "—")}</span>`],
+      ["control routes", flag(a.controls_enabled, "enabled", "503 — no API key")],
+      ["signer", a.wallet?.startsWith("0x")
+        ? `<a href="${ex}/address/${esc(a.wallet)}" target="_blank" rel="noopener">${esc(a.wallet.slice(0, 10))}…</a>`
+        : `<span class="warn">${esc(a.wallet)}</span>`],
+    ]) + ((a.config_problems || []).length
+      ? `<p class="err">${a.config_problems.map(esc).join("<br>")}</p>` : "")
+      + ((a.protocol_problems || []).length
+      ? `<p class="err">${a.protocol_problems.map(esc).join("<br>")}</p>` : "")));
+  }
+
+  // ── position ────────────────────────────────────────────────────────────
+  if (d.position?.error) out.push(card("Position", bad(d.position), true));
+  else {
+    const p = d.position, tr = d.trigger;
+    out.push(card(`Position — ${esc(p.pair)} · ${esc(p.protocol)}`,
+      rangeBar(p, tr) + kv([
+        ["token id", `<a href="${ex}/token/0x46A15B0b27311cedF172AB29E4f4766fbE7F4364?a=${esc(p.token_id)}" target="_blank" rel="noopener">${esc(p.token_id)}</a>`],
+        ["in range", flag(p.in_range, "in range", "OUT OF RANGE")],
+        ["rebalance due", flag(!p.rebalance_required, "no", "YES", true)],
+        ["reason", `<span class="dim">${esc(p.rebalance_reason)}</span>`],
+        ["tvl", "$" + num(p.tvl, 4)],
+        // Raw V3 liquidity units — NOT a token amount and NOT a money value.
+        // Labelled because a bare 3.35e17 has been read as "335,789 BNB".
+        ["liquidity (raw units)", esc(String(p.liquidity_raw ?? "—"))],
+        ["pending fees", num(p.pending_fees_usdt, 6) + " USDT · " + num(p.pending_fees_bnb, 8) + " BNB"],
+      ]), true));
+  }
+
+  // ── trigger / strategy ──────────────────────────────────────────────────
+  if (d.trigger?.error) out.push(card("Strategy", bad(d.trigger)));
+  else {
+    const t = d.trigger;
+    out.push(card("Strategy", kv([
+      ["range width", "±" + num(t.range_pct, 1) + "%"],
+      ["trigger", num(t.trigger_pct, 1) + "% of range width"],
+      ["fee tier", num(t.fee_tier, 0) + " (" + num(t.fee_tier / 10000, 2) + "%)"],
+      ["max slippage", num(t.max_slippage_pct, 2) + "%"],
+      ["rebalances below", num(t.trigger_lower_price)],
+      ["rebalances above", num(t.trigger_upper_price)],
+      ["would re-range to", num(t.target_lower_price) + " – " + num(t.target_upper_price)],
+    ]) + `<p class="empty">${esc(t.trigger_semantics)}</p>`));
+  }
+
+  // ── performance ─────────────────────────────────────────────────────────
+  if (d.performance?.error) out.push(card("Performance", bad(d.performance)));
+  else {
+    const f = d.performance, p = d.position || {};
+    // apr is null when the observed window is too thin to annualise, and
+    // "0%" would be a different claim than "not enough data yet".
+    const apr = p.apr == null ? `<span class="dim">not enough data</span>` : num(p.apr, 2) + "%";
+    out.push(card("Performance", kv([
+      ["rebalances", num(f.rebalance_count, 0)],
+      ["last rebalance", esc(ago(f.last_rebalance))],
+      ["fees collected", num(f.fees_collected_usdt, 6) + " USDT"],
+      ["fees pending", num(f.fees_pending_usdt, 6) + " USDT"],
+      ["fees total (value)", "$" + num(f.fees_total_value_usdt, 6)],
+      ["fees 24h", "$" + num(f.fees_24h_usdt, 6)
+        + (p.fees_24h_window_complete === false
+          ? ` <span class="warn">(partial window)</span>` : "")],
+      ["gas spent", num(f.gas_spent_bnb, 6) + " BNB · $" + num(f.gas_spent_usdt, 4)],
+      ["net pnl", `<span class="${f.pnl_usdt >= 0 ? "ok" : "bad"}">$${num(f.pnl_usdt, 6)}</span>`],
+      ["apr", apr],
+      ["snapshots", num(f.snapshots_recorded, 0)],
+    ])));
+  }
+
+  // ── wallet ──────────────────────────────────────────────────────────────
+  if (d.wallet?.error) out.push(card("Signer wallet", bad(d.wallet)));
+  else {
+    const w = d.wallet;
+    // A rebalance is four transactions. Below roughly this, the next one
+    // strands the position outside its range and nothing else here says so.
+    const dry = w.bnb != null && w.bnb < 0.002;
+    out.push(card("Signer wallet", kv([
+      ["address", `<a href="${ex}/address/${esc(w.address)}" target="_blank" rel="noopener">${esc(w.address)}</a>`],
+      ["bnb (gas)", `<span class="${dry ? "bad" : "ok"}">${num(w.bnb, 6)}</span>`],
+      ["wbnb", num(w.wbnb, 6)],
+      ["usdt", num(w.usdt, 4)],
+      ["gas price", num(w.gas_price_gwei, 3) + " gwei"],
+    ]) + (dry ? `<p class="err">Low gas: a rebalance is four transactions.</p>` : "")));
+  }
+
+  // ── identity ────────────────────────────────────────────────────────────
+  if (d.identity?.error) out.push(card("Identity & pricing", bad(d.identity)));
+  else {
+    const i = d.identity;
+    out.push(card("Identity & pricing", kv([
+      ["erc-8004 agent", i.agent_id
+        ? `<a href="${ex}/token/${esc(i.registry)}?a=${esc(i.agent_id)}" target="_blank" rel="noopener">${esc(i.agent_id)}</a>` : "—"],
+      ["registered", esc(String(i.registered_at || "").slice(0, 10))],
+      ["agent card", i.endpoint
+        ? `<a href="${esc(i.endpoint)}" target="_blank" rel="noopener">open</a>` : "—"],
+      ["public url", `<span class="dim">${esc(i.public_url || "—")}</span>`],
+      ["erc-8183 mount", `<span class="dim">${esc(i.erc8183_url || "—")}</span>`],
+      ["list price", num(i.price_u, 4) + " U"],
+      ["quote ttl", num(i.quote_ttl_seconds, 0) + "s"],
+    ])));
+  }
+
+  // ── quant clients ───────────────────────────────────────────────────────
+  // The other half of what this agent does: it manages its own LP position AND
+  // trades client-owned wallets on TermiX. Principal is never held here — each
+  // job is a session key over a wallet only the client can empty — so the card
+  // shows the CAP and the expiry, which are what actually bound the agent.
+  if (d.clients?.error) out.push(card("Quant clients", bad(d.clients), true));
+  else if (d.clients && d.clients.enabled === false)
+    out.push(card("Quant clients",
+      `<p class="empty">Not listed on TermiX (${esc(d.clients.reason)}).</p>`, true));
+  else if (d.clients) {
+    const st = d.clients.strategies || [], js = d.clients.jobs || [];
+
+    out.push(card(`Quant strategies (${st.length})`, st.length
+      ? `<div class="scroll"><table>
+          <tr><th>name</th><th>status</th><th>key</th><th>active jobs</th><th>trades</th><th>realized</th></tr>
+          ${st.map(x => `<tr>
+            <td>${esc(x.name)}</td>
+            <td><span class="pill ${x.status === "LISTED" ? "ok" : x.status === "PENDING_REVIEW" ? "warn" : "dim"}">${esc(x.status)}</span></td>
+            <td>${x.encryptionKeyRegistered ? `<span class="ok">yes</span>` : `<span class="bad">MISSING</span>`}</td>
+            <td class="mono">${num(x.activeJobs, 0)}</td>
+            <td class="mono">${num(x.tradeCount, 0)}</td>
+            <td class="mono">${esc(x.realizedPnlU ?? "0")} U</td></tr>`).join("")}</table></div>`
+      : `<p class="empty">No strategy listed yet.</p>`, true));
+
+    out.push(card(`Client sessions (${js.length})`, js.length
+      ? `<div class="scroll"><table>
+          <tr><th>task wallet</th><th>status</th><th>allocation</th><th>daily cap</th>
+              <th>term</th><th>session expires</th><th>trades</th><th>realized</th></tr>
+          ${js.map(j => {
+            if (j.error) return `<tr><td colspan="8" class="err">${esc(j.quantJobId)}: ${esc(j.error)}</td></tr>`;
+            // The session key stops working at expiry and the client can revoke
+            // sooner. Both end the agent's authority, so both are shown red.
+            const exp = j.sessionExpiresAt ? new Date(j.sessionExpiresAt).getTime() : null;
+            const dead = j.revokedAt || (exp && exp < Date.now());
+            const hrs = exp ? (exp - Date.now()) / 3.6e6 : null;
+            return `<tr>
+              <td class="mono">${j.tradingWalletAddress
+                ? `<a href="${ex}/address/${esc(j.tradingWalletAddress)}" target="_blank" rel="noopener">${esc(j.tradingWalletAddress.slice(0, 12))}…</a>` : "—"}</td>
+              <td><span class="pill ${dead ? "bad" : j.status === "ACTIVE" ? "ok" : "warn"}">${esc(j.revokedAt ? "REVOKED" : j.status)}</span></td>
+              <td class="mono">${esc(j.allocationU ?? "—")} U</td>
+              <td class="mono">${esc(j.dailyCapU ?? "—")} U</td>
+              <td class="dim">${esc(j.termDays ?? "—")}d</td>
+              <td class="${hrs != null && hrs < 24 ? "bad" : "dim"}">${esc(String(j.sessionExpiresAt || "").slice(0, 10))}${hrs != null && hrs > 0 ? ` <span class="dim">(${num(hrs / 24, 1)}d)</span>` : ""}</td>
+              <td class="mono">${num((j.trades || []).length, 0)}</td>
+              <td class="mono">${esc(j.realizedPnlU ?? "0")} U</td></tr>`;
+          }).join("")}</table></div>
+        <p class="empty">${esc(d.clients.custody)}</p>`
+      : `<p class="empty">No client has hired the strategy yet.</p>`, true));
+
+    // Indexed trades, per job. This is the record the client sees and the one a
+    // dispute is judged against — never the agent's own bookkeeping.
+    js.filter(j => (j.trades || []).length).forEach(j => {
+      out.push(card(`Trades — ${String(j.tradingWalletAddress || j.quantJobId).slice(0, 12)}…`,
+        `<div class="scroll"><table>
+          <tr><th>when</th><th>side</th><th>in</th><th>out</th><th>tx</th></tr>
+          ${j.trades.map(t => `<tr>
+            <td class="dim">${esc(ago(t.at || t.blockTime || t.createdAt))}</td>
+            <td>${esc(t.side ?? "—")}</td>
+            <td class="mono">${esc(t.amountIn ?? "—")}</td>
+            <td class="mono">${esc(t.amountOut ?? "—")}</td>
+            <td class="mono">${t.txHash ? tx(ex, t.txHash) : "—"}</td></tr>`).join("")}</table></div>`, true));
+    });
+  }
+
+  // ── rebalance history ───────────────────────────────────────────────────
+  const h = (d.performance && !d.performance.error ? d.performance.history : []) || [];
+  out.push(card(`Rebalance history (${h.length})`, h.length
+    ? `<div class="scroll"><table>
+        <tr><th>when</th><th>from</th><th>to</th><th>reason</th><th>gas</th><th>transactions</th></tr>
+        ${h.slice().reverse().map(r => `<tr>
+          <td class="dim">${esc(ago(r.at || r.timestamp))}</td>
+          <td class="mono">${esc(r.old_token_id ?? "—")}</td>
+          <td class="mono">${esc(r.new_token_id ?? "—")}</td>
+          <td class="dim">${esc(r.reason ?? "—")}</td>
+          <td class="mono">${num((r.gas_wei ?? 0) / 1e18, 6)}</td>
+          <td class="mono">${(r.txs || []).map(x => tx(ex, x)).join(" ")}</td>
+        </tr>`).join("")}</table></div>`
+    : `<p class="empty">No rebalance has run yet.</p>`, true));
+
+  $("cards").innerHTML = out.join("");
+  $("stamp").textContent = "updated " + new Date().toLocaleTimeString();
+}
+
+async function load() {
+  const key = sessionStorage.getItem(KEY);
+  if (!key) return gate();
+  try {
+    const res = await fetch("dashboard/data", { headers: { "X-API-Key": key } });
+    if (res.status === 401) { sessionStorage.removeItem(KEY); return gate("That key was rejected."); }
+    if (res.status === 503) return gate("Dashboard disabled: SERVICE_API_KEY is not set on the host.");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    render(await res.json());
+  } catch (e) {
+    $("stamp").textContent = "refresh failed: " + e.message;
+  }
+}
+
+function gate(msg) {
+  if (timer) { clearInterval(timer); timer = null; }
+  $("app").hidden = true; $("gate").hidden = false;
+  $("gateErr").textContent = msg || "";
+  $("key").focus();
+}
+
+function unlock() {
+  const v = $("key").value.trim();
+  if (!v) return;
+  sessionStorage.setItem(KEY, v);
+  $("key").value = "";
+  $("gate").hidden = true; $("app").hidden = false;
+  load();
+  // 30s: the monitor only polls every 60s, so anything faster redraws the same
+  // numbers while making four extra chain reads per tick.
+  timer = setInterval(load, 30000);
+}
+
+$("unlock").onclick = unlock;
+$("key").addEventListener("keydown", (e) => e.key === "Enter" && unlock());
+$("refresh").onclick = load;
+$("lock").onclick = () => { sessionStorage.removeItem(KEY); gate(); };
+
+if (sessionStorage.getItem(KEY)) { $("app").hidden = false; load(); timer = setInterval(load, 30000); }
+else gate();
+</script>
